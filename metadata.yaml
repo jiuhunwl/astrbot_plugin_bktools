@@ -1,0 +1,6 @@
+name: astrbot_plugin_bktools
+display_name: BKtools（BugPk 工具集）
+desc: 基于 BugPk 公益接口的短视频解析、音乐搜索与解析；接口地址与 JSON 字段路径可在后台配置。
+version: v1.0.0
+author: jiuhunwl
+repo: https://github.com/jiuhunwl/astrbot_plugin_bktools
