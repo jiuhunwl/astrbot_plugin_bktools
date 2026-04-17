@@ -199,6 +199,17 @@ def _music_platform(url: str) -> Optional[str]:
     return None
 
 
+def _looks_like_qishui_share_context(text: str, url: str) -> bool:
+    """汽水分享常见于文案含“汽水”+ 短链（v.douyin.com）。"""
+    t = (text or "").lower()
+    u = (url or "").lower()
+    if "qishui.douyin.com" in u:
+        return True
+    if "汽水" in t and ("douyin.com" in u or "iesdouyin.com" in u):
+        return True
+    return False
+
+
 def _extract_netease_song_id(text: str) -> str:
     s = (text or "").strip()
     if not s:
@@ -377,6 +388,29 @@ class BKToolsPlugin(Star):
             return u
         low = u.lower()
         if "163cn.tv" not in low and "y.music.163.com" not in low:
+            return u
+        try:
+            async with session.head(u, allow_redirects=True) as resp:
+                final_u = str(resp.url)
+                if final_u:
+                    return final_u
+        except Exception:
+            pass
+        try:
+            async with session.get(u, allow_redirects=True) as resp:
+                final_u = str(resp.url)
+                if final_u:
+                    return final_u
+        except Exception:
+            pass
+        return u
+
+    async def _resolve_final_url(
+        self, session: aiohttp.ClientSession, link: str
+    ) -> str:
+        """通用重定向展开（用于汽水等分享短链识别）。"""
+        u = (link or "").strip()
+        if not u:
             return u
         try:
             async with session.head(u, allow_redirects=True) as resp:
@@ -657,9 +691,6 @@ class BKToolsPlugin(Star):
 
     async def _music_link_parse(self, event: AstrMessageEvent, link: str) -> None:
         plat = _music_platform(link)
-        if not plat:
-            await event.send(event.plain_result("无法识别音乐平台链接。"))
-            return
         ne = _cfg(self.config, "netease", default={}) or {}
         lo = _cfg(self.config, "link_only_music", default={}) or {}
         timeout_sec, ua = self._http_cfg()
@@ -675,6 +706,26 @@ class BKToolsPlugin(Star):
         album_p = ""
         size_p = ""
         level_p = ""
+
+        req_link = link
+        try:
+            async with aiohttp.ClientSession(timeout=to, headers=headers) as session:
+                # 未识别平台时尝试展开短链（如 v.douyin.com -> qishui.douyin.com）
+                if not plat:
+                    resolved = await self._resolve_final_url(session, req_link)
+                    if resolved:
+                        req_link = resolved
+                        plat = _music_platform(req_link)
+                if plat == "netease":
+                    expanded = await self._expand_netease_short_link(session, req_link)
+                    if expanded:
+                        req_link = expanded
+        except Exception:
+            pass
+
+        if not plat:
+            await event.send(event.plain_result("无法识别音乐平台链接。"))
+            return
 
         if plat == "netease":
             endpoint = (
@@ -698,7 +749,7 @@ class BKToolsPlugin(Star):
                 netease_parse_extra = {}
             if not netease_parse_extra:
                 netease_parse_extra = {"type": "json", "level": "standard"}
-            netease_song_id = _extract_netease_song_id(link)
+            netease_song_id = _extract_netease_song_id(req_link)
             path_code = ne.get("parse_path_code") or "code"
             path_msg = ne.get("parse_path_msg") or "msg"
             ok = _parse_success_codes(str(ne.get("parse_success_codes", "200")))
@@ -750,19 +801,11 @@ class BKToolsPlugin(Star):
                 lyric_p = lo.get("kuwo_lyric_path") or "lyrics_url"
 
         await self._maybe_opening(event)
-        req_link = link
         req_params: Dict[str, Any] = {url_key: req_link}
         if plat == "netease":
             req_params = {**netease_parse_extra, url_key: req_link}
         try:
             async with aiohttp.ClientSession(timeout=to, headers=headers) as session:
-                if plat == "netease":
-                    expanded = await self._expand_netease_short_link(session, req_link)
-                    if expanded and expanded != req_link:
-                        req_link = expanded
-                        req_params = {**netease_parse_extra, url_key: req_link}
-                        # 展开后再提取一次 id，供 ids 回退请求使用
-                        netease_song_id = _extract_netease_song_id(req_link) or netease_song_id
                 if method == "POST":
                     j = await self._session_post_form(session, endpoint, req_params)
                 else:
@@ -987,14 +1030,15 @@ class BKToolsPlugin(Star):
         if text.strip().startswith("/bk"):
             return
 
+        # 优先识别音乐链接，避免“汽水分享短链（douyin）”误判为短视频。
+        if tr.get("auto_music_link"):
+            for u in urls:
+                if _music_platform(u) or _looks_like_qishui_share_context(text, u):
+                    await self._music_link_parse(event, u)
+                    return
+
         if tr.get("auto_short_video"):
             for u in urls:
                 if _video_auto_match(u):
                     await self._reply_short_video(event, u)
-                    return
-
-        if tr.get("auto_music_link"):
-            for u in urls:
-                if _music_platform(u):
-                    await self._music_link_parse(event, u)
                     return
