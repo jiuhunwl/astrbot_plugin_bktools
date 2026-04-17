@@ -192,7 +192,7 @@ def _music_platform(url: str) -> Optional[str]:
         return "netease"
     if "y.qq.com" in u or "qq.com/n/ryqq" in u:
         return "qq"
-    if "qishui.douyin.com" in u:
+    if "qishui.douyin.com" in u or "music.douyin.com" in u:
         return "qishui"
     if "kuwo.cn" in u:
         return "kuwo"
@@ -200,14 +200,8 @@ def _music_platform(url: str) -> Optional[str]:
 
 
 def _looks_like_qishui_share_context(text: str, url: str) -> bool:
-    """汽水分享常见于文案含“汽水”+ 短链（v.douyin.com）。"""
-    t = (text or "").lower()
     u = (url or "").lower()
-    if "qishui.douyin.com" in u:
-        return True
-    if "汽水" in t and ("douyin.com" in u or "iesdouyin.com" in u):
-        return True
-    return False
+    return "qishui.douyin.com" in u or "music.douyin.com" in u
 
 
 def _extract_netease_song_id(text: str) -> str:
