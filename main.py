@@ -243,8 +243,7 @@ def _video_auto_match(url: str) -> bool:
     "astrbot_plugin_bktools",
     "jiuhunwl",
     "BugPk 工具：短视频解析、网易云搜歌、QQ/汽水/酷我链解析",
-    "1.1.0",
-    icon="https://static.esa.ifphp.com/img/bugpk-Api-256×256.ico"
+    "1.1.0"
 )
 class BKToolsPlugin(Star):
     def __init__(self, context: Context, config: Optional[Dict[str, Any]] = None):
