@@ -143,6 +143,4 @@
 
 ## Star History
 
-<a href="https://www.star-history.com/#jiuhunwl/astrbot_plugin_bktools&Date">
-  <img alt="Star History Chart" src="https://api.star-history.com/svg?repos=jiuhunwl/astrbot_plugin_bktools&type=Date" />
-</a>
+[![Star History Chart](https://api.star-history.com/chart?repos=jiuhunwl/astrbot_plugin_bktools&type=date&legend=top-left)](https://www.star-history.com/?repos=jiuhunwl%2Fastrbot_plugin_bktools&type=date&legend=top-left)
