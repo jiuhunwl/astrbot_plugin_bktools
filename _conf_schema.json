@@ -418,7 +418,7 @@
       "opening_enable": {
         "description": "解析前发送开场语",
         "type": "bool",
-        "default": false
+        "default": true
       },
       "opening_text": {
         "type": "string",

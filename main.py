@@ -183,7 +183,20 @@ def _chain_to_forward_nodes(
 
 
 def _extract_urls(text: str) -> List[str]:
-    return re.findall(r"https?://[^\s\]>\"']+", text or "")
+    raw_urls = re.findall(r"https?://[^\s\]>\"']+", text or "")
+    # 处理中文/英文结尾标点，避免复制分享文案时把标点一起带进链接
+    tail_punc = ".,!?;:)]}，。！？；：）】》」』、"
+    return [u.rstrip(tail_punc) for u in raw_urls if u.rstrip(tail_punc)]
+
+
+def _is_qishui_url(url: str) -> bool:
+    u = (url or "").lower()
+    return (
+        "qishui.douyin.com" in u
+        or "music.douyin.com" in u
+        or "qishui.com" in u
+        or "www.qishui.com" in u
+    )
 
 
 def _music_platform(url: str) -> Optional[str]:
@@ -192,7 +205,7 @@ def _music_platform(url: str) -> Optional[str]:
         return "netease"
     if "y.qq.com" in u or "qq.com/n/ryqq" in u:
         return "qq"
-    if "qishui.douyin.com" in u or "music.douyin.com" in u:
+    if _is_qishui_url(u):
         return "qishui"
     if "kuwo.cn" in u:
         return "kuwo"
@@ -200,8 +213,14 @@ def _music_platform(url: str) -> Optional[str]:
 
 
 def _looks_like_qishui_share_context(text: str, url: str) -> bool:
+    if _is_qishui_url(url):
+        return True
     u = (url or "").lower()
-    return "qishui.douyin.com" in u or "music.douyin.com" in u
+    t = (text or "").lower()
+    # 常见“汽水音乐 + 抖音短链”分享文案兜底识别
+    if ("v.douyin.com" in u or "iesdouyin.com" in u) and ("汽水" in t or "qishui" in t):
+        return True
+    return False
 
 
 def _extract_netease_song_id(text: str) -> str:
@@ -217,6 +236,9 @@ def _extract_netease_song_id(text: str) -> str:
 
 def _video_auto_match(url: str) -> bool:
     u = (url or "").lower()
+    # 排除汽水音乐链接
+    if _is_qishui_url(u):
+        return False
     for h in (
         "douyin.com",
         "iesdouyin.com",
@@ -494,7 +516,7 @@ class BKToolsPlugin(Star):
         try:
             j, data = await self._fetch_short_video(link)
         except Exception as e:
-            logger.warning("短视频解析失败: %s", e)
+            logger.warning("短视频解析失败: %s，链接: %s", e, link)
             await event.send(event.plain_result(f"短视频解析失败：{e}"))
             return
         cfg_sv = _cfg(self.config, "short_video", default={}) or {}
@@ -718,7 +740,8 @@ class BKToolsPlugin(Star):
             pass
 
         if not plat:
-            await event.send(event.plain_result("无法识别音乐平台链接。"))
+            logger.warning("无法识别音乐平台链接: %s", req_link)
+            await event.send(event.plain_result(f"无法识别音乐平台链接：{req_link}"))
             return
 
         if plat == "netease":
@@ -1024,13 +1047,21 @@ class BKToolsPlugin(Star):
         if text.strip().startswith("/bk"):
             return
 
-        # 优先识别音乐链接，避免“汽水分享短链（douyin）”误判为短视频。
+        # 最高优先级：优先识别汽水音乐链接
+        qishui_links = [u for u in urls if _is_qishui_url(u)]
+        if qishui_links and tr.get("auto_music_link"):
+            for u in qishui_links:
+                await self._music_link_parse(event, u)
+                return
+
+        # 次优先级：识别其他音乐链接
         if tr.get("auto_music_link"):
             for u in urls:
                 if _music_platform(u) or _looks_like_qishui_share_context(text, u):
                     await self._music_link_parse(event, u)
                     return
 
+        # 最后：识别短视频链接
         if tr.get("auto_short_video"):
             for u in urls:
                 if _video_auto_match(u):
