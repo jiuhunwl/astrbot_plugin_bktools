@@ -4,7 +4,6 @@
 插件基于可配置接口工作（默认示例为 [BugPk-Api](https://api.bugpk.com/)），接口地址和 JSON 字段路径都可在 AstrBot WebUI 自定义。
 
 - 仓库地址：<https://github.com/jiuhunwl/astrbot_plugin_bktools>
-- 参考文档风格：[astrbot_plugin_group_geetest_verify](https://github.com/VanillaNahida/astrbot_plugin_group_geetest_verify)
 
 ---
 

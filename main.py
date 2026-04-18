@@ -317,11 +317,36 @@ def _video_auto_match(url: str) -> bool:
     return False
 
 
+def _is_douyin_profile_url(url: str) -> bool:
+    """检测是否为抖音用户主页链接"""
+    u = (url or "").lower()
+    if u.startswith("v.douyin.com"):
+        path_lower = u.lower()
+        if "/show/" in path_lower or "/video/" in path_lower or "/item/" in path_lower:
+            return False
+        return True
+    return (
+        "/user/" in u
+        or "douyin.com/user" in u
+    )
+
+
+async def _resolve_short_url(url: str, timeout_sec: int = 10) -> str:
+    """解析短链接，返回最终 URL"""
+    try:
+        headers = {"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36"}
+        async with aiohttp.ClientSession() as session:
+            async with session.get(url, allow_redirects=True, timeout=aiohttp.ClientTimeout(total=timeout_sec), headers=headers) as resp:
+                return str(resp.url)
+    except Exception:
+        return url
+
+
 @register(
     "astrbot_plugin_bktools",
     "jiuhunwl",
     "BugPk 工具：短视频解析、网易云搜歌、QQ/汽水/酷我链解析",
-    "1.1.1"
+    "1.1.5"
 )
 class BKToolsPlugin(Star):
     def __init__(self, context: Context, config: Optional[Dict[str, Any]] = None):
@@ -540,7 +565,6 @@ class BKToolsPlugin(Star):
         j: Dict[str, Any],
         *,
         include_video_line: bool = True,
-        original_link: str = "",
     ) -> str:
         lines: List[str] = []
         title = _rel_data(data, cfg_sv.get("path_title") or "title", j) or ""
@@ -569,8 +593,6 @@ class BKToolsPlugin(Star):
             lines.append("原声：" + " / ".join(parts))
             if mu:
                 lines.append(f"原声链接：{mu}")
-        if original_link:
-            lines.append(f"原始链接：{original_link}")
         return "\n".join(lines) if lines else "（无文本信息）"
 
     async def _reply_short_video(self, event: AstrMessageEvent, link: str) -> None:
@@ -609,18 +631,15 @@ class BKToolsPlugin(Star):
         pack_send_video = bool(msg_cfg.get("pack_send_video", True))
         pack_include_cover = bool(msg_cfg.get("pack_include_cover", True))
         text_meta = bool(msg_cfg.get("short_video_text_metadata", True))
-        append_orig = bool(msg_cfg.get("pack_append_original_link", True))
 
         include_video_line = True
         if video_urls and pack_send_video:
             include_video_line = False
-        orig = link if append_orig else ""
         text = self._format_short_video_text(
             cfg_sv,
             data,
             j,
             include_video_line=include_video_line,
-            original_link=orig,
         )
 
         chain: List[Any] = []
@@ -668,11 +687,156 @@ class BKToolsPlugin(Star):
                 batch_pure_image_gallery=batch_gallery,
             )
             if flat:
-                await event.send(event.chain_result([Nodes(flat)]))
+                try:
+                    await event.send(event.chain_result([Nodes(flat)]))
+                except Exception as ex:
+                    logger.warning("发送合并转发失败: %s，尝试逐条发送", ex)
+                    for comp in chain:
+                        try:
+                            await event.send(event.chain_result([comp]))
+                        except Exception as ex2:
+                            logger.warning("发送节点失败: %s", ex2)
         else:
             for comp in chain:
+                 try:
+                     await event.send(event.chain_result([comp]))
+                 except Exception as ex:
+                     logger.warning("发送节点失败: %s", ex)
+
+    async def _fetch_douyin_profile(self, profile_url: str) -> Tuple[Dict[str, Any], List[Dict[str, Any]]]:
+        cfg_sv = _cfg(self.config, "short_video", default={}) or {}
+        endpoint = (cfg_sv.get("endpoint") or "").strip().rstrip("?&")
+        if not endpoint:
+            raise ValueError("未配置短视频 endpoint")
+        param = cfg_sv.get("url_param_name") or "url"
+        method = (cfg_sv.get("request_method") or "GET").upper()
+        timeout_sec, ua = self._http_cfg()
+        headers = {"User-Agent": ua}
+        to = aiohttp.ClientTimeout(total=timeout_sec)
+        async with aiohttp.ClientSession(timeout=to, headers=headers) as session:
+            if method == "POST":
+                j = await self._session_post_form(session, endpoint, {param: profile_url})
+            else:
+                q = urlencode({param: profile_url})
+                sep = "&" if "?" in endpoint else "?"
+                j = await self._session_get_json(session, f"{endpoint}{sep}{q}")
+        ok = _parse_success_codes(str(cfg_sv.get("success_codes", "200")))
+        if not _code_ok(j, cfg_sv.get("path_code") or "code", ok):
+            msg = get_path(j, cfg_sv.get("path_msg") or "msg") or "接口返回失败"
+            raise ValueError(str(msg))
+        path_root = (cfg_sv.get("path_data_root") or "data").strip() or "data"
+        data = get_path(j, path_root)
+        if not isinstance(data, list):
+            data = []
+        return j, list(data)
+
+    def _format_profile_item_text(
+        self,
+        item: Dict[str, Any],
+        j: Dict[str, Any],
+    ) -> str:
+        lines: List[str] = []
+        author = str(item.get("author", ""))
+        typ = str(item.get("type", ""))
+        desc = str(item.get("desc", ""))
+        create_time = str(item.get("create_time", ""))
+        duration = item.get("duration")
+        mt = str(item.get("music_title", ""))
+        ma = str(item.get("music_author", ""))
+        stats = item.get("statistics", {}) or {}
+        digg = str(stats.get("digg_count", "0"))
+        comment = str(stats.get("comment_count", "0"))
+        share = str(stats.get("share_count", "0"))
+        collect = str(stats.get("collect_count", "0"))
+        play = str(stats.get("play_count", "0"))
+
+        if author:
+            lines.append(f"👤 {author}")
+        if typ:
+            type_emoji = "🎬" if typ == "video" else "🖼️"
+            lines.append(f"{type_emoji} 类型：{typ}")
+        if desc:
+            desc_short = str(desc)[:100] + "..." if len(str(desc)) > 100 else str(desc)
+            lines.append(f"📝 {desc_short}")
+        if create_time:
+            lines.append(f"⏰ {create_time}")
+        if duration:
+            lines.append(f"⏳ 时长：{float(duration):.1f}秒")
+        lines.append(f"📊 赞:{digg} 评:{comment} 转:{share} 藏:{collect} ▶️:{play}")
+        if mt or ma:
+            lines.append(f"🎵 原声：{mt} - {ma}" if mt and ma else f"🎵 原声：{mt or ma}")
+        return "\n".join(lines)
+
+    async def _reply_douyin_profile(self, event: AstrMessageEvent, profile_url: str) -> None:
+        await self._maybe_opening(event)
+        try:
+            j, items = await self._fetch_douyin_profile(profile_url)
+        except Exception as e:
+            logger.warning("抖音主页解析失败: %s，链接: %s", e, profile_url)
+            await event.send(event.plain_result(f"抖音主页解析失败：{e}"))
+            return
+
+        if not items:
+            await event.send(event.plain_result("未获取到作品数据"))
+            return
+
+        msg_cfg = _cfg(self.config, "message", default={}) or {}
+
+        pagination = j.get("pagination", {}) or {}
+        total = pagination.get("total", len(items))
+        has_more = pagination.get("has_more", False)
+
+        name, uid = self._bot_identity(event)
+        nodes: List[Node] = []
+
+        header_text = f"🎭 抖音主页作品列表（共 {total} 个作品）"
+        nodes.append(Node(name=name, uin=uid, content=[Plain(header_text)]))
+
+        max_items = min(len(items), int(msg_cfg.get("search_result_limit", 8) or 8))
+
+        for i in range(max_items):
+            item = items[i]
+            if not isinstance(item, dict):
+                continue
+            item_text = self._format_profile_item_text(item, j)
+            nodes.append(Node(name=name, uin=uid, content=[Plain(item_text)]))
+
+            typ = str(item.get("type", ""))
+            cover = str(item.get("cover", ""))
+
+            if typ == "video":
+                vurl = str(item.get("url", ""))
+                if vurl:
+                    vn = _make_video_node(vurl)
+                    if vn:
+                        nodes.append(Node(name=name, uin=uid, content=[vn]))
+            elif typ == "image":
+                images_data = item.get("images")
+                if isinstance(images_data, list):
+                    max_imgs = int(msg_cfg.get("max_images_per_work", 9) or 9)
+                    for img_url in images_data[:max_imgs]:
+                        if img_url:
+                            im = _make_image_node(str(img_url))
+                            if im:
+                                nodes.append(Node(name=name, uin=uid, content=[im]))
+
+            if cover:
+                ci = _make_image_node(str(cover))
+                if ci:
+                    nodes.append(Node(name=name, uin=uid, content=[ci]))
+
+        if has_more:
+            nodes.append(Node(name=name, uin=uid, content=[Plain(f"⚠️ 还有更多作品未显示，请访问原主页查看完整列表")]))
+
+        pack = bool(msg_cfg.get("pack_forward", True))
+        if pack and nodes:
+            flat = _chain_to_forward_nodes(nodes, name, uid, batch_pure_image_gallery=False)
+            if flat:
+                await event.send(event.chain_result([Nodes(flat)]))
+        else:
+            for node in nodes:
                 try:
-                    await event.send(event.chain_result([comp]))
+                    await event.send(event.chain_result([node]))
                 except Exception as ex:
                     logger.warning("发送节点失败: %s", ex)
 
@@ -1045,6 +1209,7 @@ class BKToolsPlugin(Star):
             event.plain_result(
                 "【BKtools】\n"
                 "· /bk视频 <链接> — 短视频解析\n"
+                "· /bk主页 <用户主页链接> — 抖音主页作品列表解析\n"
                 "· /bk网易云 <关键词> — 仅网易云搜索（需配置搜索接口）\n"
                 "· /bk点歌 <序号> — 选择最近一次网易云搜索结果\n"
                 "· /bk音乐 <音乐分享链接> — QQ/汽水/酷我/网易等链接解析（无搜索）\n"
@@ -1072,6 +1237,15 @@ class BKToolsPlugin(Star):
             await event.send(event.plain_result("用法：/bktv <作品链接>"))
             return
         await self._reply_short_video(event, arg)
+
+    @filter.command("bk主页")
+    async def cmd_douyin_profile(self, event: AstrMessageEvent):
+        """抖音主页作品列表解析"""
+        arg = self._cmd_arg(event, "bk主页")
+        if not arg:
+            await event.send(event.plain_result("用法：/bk主页 <抖音用户主页链接>"))
+            return
+        await self._reply_douyin_profile(event, arg)
 
     @filter.command("bk网易云")
     async def cmd_netease(self, event: AstrMessageEvent):
@@ -1121,6 +1295,9 @@ class BKToolsPlugin(Star):
     @filter.event_message_type(EventMessageType.ALL)
     async def on_auto(self, event: AstrMessageEvent):
         """自动触发短视频 / 音乐链"""
+        user_id = getattr(event, 'user_id', None)
+        if user_id == 0:
+            return
         tr = _cfg(self.config, "trigger", default={}) or {}
         text = event.message_str or ""
         pure = text.strip()
@@ -1131,27 +1308,38 @@ class BKToolsPlugin(Star):
         urls = _extract_urls(text)
         if not urls:
             return
-        # 避免与显式指令冲突（简单判断）
         if text.strip().startswith("/bk"):
             return
 
-        # 最高优先级：优先识别汽水音乐链接
-        qishui_links = [u for u in urls if _is_qishui_url(u)]
-        if qishui_links and tr.get("auto_music_link"):
-            for u in qishui_links:
-                await self._music_link_parse(event, u)
-                return
+        resolved_urls = []
+        for u in urls:
+            resolved = await _resolve_short_url(u)
+            resolved_urls.append(resolved)
 
-        # 次优先级：识别其他音乐链接
-        if tr.get("auto_music_link"):
-            for u in urls:
-                if _music_platform(u) or _looks_like_qishui_share_context(text, u):
-                    await self._music_link_parse(event, u)
+        for i, resolved in enumerate(resolved_urls):
+            orig = urls[i]
+
+            if tr.get("auto_music_link"):
+                if _is_qishui_url(orig) or _is_qishui_url(resolved):
+                    await self._music_link_parse(event, orig)
+                    return
+                if _music_platform(resolved) or (orig != resolved and _music_platform(orig)):
+                    await self._music_link_parse(event, orig)
                     return
 
-        # 最后：识别短视频链接
-        if tr.get("auto_short_video"):
-            for u in urls:
-                if _video_auto_match(u):
-                    await self._reply_short_video(event, u)
+        for i, resolved in enumerate(resolved_urls):
+            orig = urls[i]
+
+            if tr.get("auto_douyin_profile"):
+                if _is_douyin_profile_url(resolved) or (orig != resolved and _is_douyin_profile_url(orig)):
+                    await self._reply_douyin_profile(event, orig)
                     return
+
+        for i, resolved in enumerate(resolved_urls):
+            orig = urls[i]
+
+            if tr.get("auto_short_video"):
+                if _video_auto_match(resolved) or (orig != resolved and _video_auto_match(orig)):
+                    if not _is_douyin_profile_url(resolved):
+                        await self._reply_short_video(event, orig)
+                        return

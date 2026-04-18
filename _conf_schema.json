@@ -484,6 +484,11 @@
         "description": "消息中出现音乐平台分享链接时自动链解析（仅链接，无搜索）",
         "type": "bool",
         "default": false
+      },
+      "auto_douyin_profile": {
+        "description": "消息中出现抖音用户主页链接时自动解析",
+        "type": "bool",
+        "default": false
       }
     }
   }
