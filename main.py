@@ -6,7 +6,9 @@ AstrBot 插件：BugPk 工具集（短视频解析、网易云搜歌、多平台
 from __future__ import annotations
 
 import json
+import os
 import re
+import tempfile
 import time
 from typing import Any, Dict, List, Optional, Tuple
 from urllib.parse import quote_plus, urlencode
@@ -15,7 +17,7 @@ import aiohttp
 
 from astrbot.api import logger
 from astrbot.api.event import filter, AstrMessageEvent
-from astrbot.api.message_components import Image, Node, Nodes, Plain, Video
+from astrbot.api.message_components import Image, Node, Nodes, Plain, Record, Video
 from astrbot.api.star import Context, Star, register
 from astrbot.core.star.filter.event_message_type import EventMessageType
 
@@ -189,6 +191,66 @@ def _extract_urls(text: str) -> List[str]:
     return [u.rstrip(tail_punc) for u in raw_urls if u.rstrip(tail_punc)]
 
 
+async def _download_audio(url: str, timeout_sec: int = 60) -> Optional[str]:
+    """下载音频文件到临时目录，返回文件路径"""
+    try:
+        async with aiohttp.ClientSession(timeout=aiohttp.ClientTimeout(total=timeout_sec)) as session:
+            async with session.get(url) as resp:
+                if resp.status != 200:
+                    logger.warning("下载音频失败: HTTP %d", resp.status)
+                    return None
+                
+                # 创建临时文件
+                fd, temp_path = tempfile.mkstemp(suffix=".mp3", prefix="bktools_audio_")
+                try:
+                    with os.fdopen(fd, 'wb') as f:
+                        async for chunk in resp.content.iter_chunked(8192):
+                            f.write(chunk)
+                    logger.info("音频下载成功: %s", temp_path)
+                    return temp_path
+                except Exception as e:
+                    logger.error("写入临时文件失败: %s", e)
+                    if os.path.exists(temp_path):
+                        os.unlink(temp_path)
+                    return None
+    except Exception as e:
+        logger.error("下载音频失败: %s", e)
+        return None
+
+
+def _convert_to_wav(input_path: str, max_duration_sec: int = 60) -> Optional[str]:
+    """将音频文件转换为 wav 格式，并限制时长"""
+    try:
+        from pydub import AudioSegment
+        
+        # 加载音频文件
+        audio = AudioSegment.from_file(input_path)
+        
+        # 限制时长
+        if len(audio) > max_duration_sec * 1000:
+            audio = audio[:max_duration_sec * 1000]
+            logger.info("音频已截断至 %d 秒", max_duration_sec)
+        
+        # 转换为 wav 格式
+        fd, wav_path = tempfile.mkstemp(suffix=".wav", prefix="bktools_voice_")
+        os.close(fd)
+        
+        audio.export(wav_path, format="wav")
+        logger.info("音频转换成功: %s", wav_path)
+        
+        # 删除原始文件
+        if os.path.exists(input_path):
+            os.unlink(input_path)
+        
+        return wav_path
+    except ImportError:
+        logger.warning("pydub 未安装，无法转换音频格式")
+        return None
+    except Exception as e:
+        logger.error("音频转换失败: %s", e)
+        return None
+
+
 def _is_qishui_url(url: str) -> bool:
     u = (url or "").lower()
     return (
@@ -259,7 +321,7 @@ def _video_auto_match(url: str) -> bool:
     "astrbot_plugin_bktools",
     "jiuhunwl",
     "BugPk 工具：短视频解析、网易云搜歌、QQ/汽水/酷我链解析",
-    "1.1.0"
+    "1.1.1"
 )
 class BKToolsPlugin(Star):
     def __init__(self, context: Context, config: Optional[Dict[str, Any]] = None):
@@ -929,6 +991,31 @@ class BKToolsPlugin(Star):
             lines.append("歌词预览：\n" + preview)
         text = "\n".join(x for x in lines if x)
         msg_cfg = _cfg(self.config, "message", default={}) or {}
+        
+        # 尝试发送语音消息
+        voice_sent = False
+        if msg_cfg.get("send_voice_message") and audio:
+            try:
+                logger.info("尝试发送语音消息: %s", audio)
+                temp_audio = await _download_audio(str(audio), timeout_sec=self._http_cfg()[0])
+                if temp_audio:
+                    wav_path = _convert_to_wav(temp_audio, max_duration_sec=int(msg_cfg.get("voice_max_duration", 60)))
+                    if wav_path and os.path.exists(wav_path):
+                        try:
+                            voice_node = Record(file=wav_path, url=wav_path)
+                            await event.send(event.chain_result([voice_node]))
+                            voice_sent = True
+                            logger.info("语音消息发送成功")
+                        finally:
+                            # 清理临时文件
+                            if os.path.exists(wav_path):
+                                os.unlink(wav_path)
+                    else:
+                        logger.warning("音频转换失败")
+            except Exception as e:
+                logger.warning("发送语音消息失败: %s", e)
+        
+        # 发送文本消息和封面
         if msg_cfg.get("pack_forward") and cover:
             name, uid = self._bot_identity(event)
             cov_node = _make_image_node(str(cover))
@@ -963,6 +1050,7 @@ class BKToolsPlugin(Star):
                 "· /bk音乐 <音乐分享链接> — QQ/汽水/酷我/网易等链接解析（无搜索）\n"
                 "短视频：默认合并转发（Nodes），纯图集会合并图片节点，"
                 "含视频时用 Video.fromURL，详见 message / short_video 配置项。\n"
+                "语音消息：可在配置中开启 send_voice_message，自动将音乐转换为语音消息发送。\n"
                 "自动短视频：可在配置中开启 trigger.auto_short_video"
             )
         )

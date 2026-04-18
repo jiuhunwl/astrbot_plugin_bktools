@@ -458,6 +458,16 @@
         "description": "网易云搜索最多展示条数",
         "type": "int",
         "default": 8
+      },
+      "send_voice_message": {
+        "description": "音乐解析：是否发送语音消息（需要安装 pydub 和 ffmpeg）",
+        "type": "bool",
+        "default": false
+      },
+      "voice_max_duration": {
+        "description": "语音消息最大时长（秒），超过将自动截断",
+        "type": "int",
+        "default": 60
       }
     }
   },
