@@ -5,13 +5,14 @@ AstrBot 插件：BugPk 工具集（短视频解析、网易云搜歌、多平台
 
 from __future__ import annotations
 
+import hashlib
 import json
 import os
 import re
 import tempfile
 import time
 from typing import Any, Dict, List, Optional, Tuple
-from urllib.parse import quote_plus, urlencode
+from urllib.parse import quote, quote_plus, urlencode
 
 import aiohttp
 
@@ -152,36 +153,162 @@ def _make_video_node(url: str) -> Optional[Video]:
         return None
 
 
-def _is_pure_image_gallery_nodes(nodes: List[Any]) -> bool:
-    has_v = any(isinstance(n, Video) for n in nodes)
-    has_i = any(isinstance(n, Image) for n in nodes)
-    return has_i and not has_v
-
-
 def _chain_to_forward_nodes(
     chain: List[Any],
     sender_name: str,
     sender_id: Any,
-    *,
-    batch_pure_image_gallery: bool,
 ) -> List[Node]:
     if not chain:
         return []
-    if batch_pure_image_gallery and _is_pure_image_gallery_nodes(chain):
-        texts = [n for n in chain if isinstance(n, Plain)]
-        images = [n for n in chain if isinstance(n, Image)]
-        flat: List[Node] = []
-        for t in texts:
-            flat.append(Node(name=sender_name, uin=sender_id, content=[t]))
-        if images:
-            flat.append(Node(name=sender_name, uin=sender_id, content=images))
-        return flat
     flat: List[Node] = []
     for n in chain:
         if n is None:
             continue
         flat.append(Node(name=sender_name, uin=sender_id, content=[n]))
     return flat
+
+
+class AlistUploader:
+    """Alist 文件上传封装"""
+
+    def __init__(self, config: Dict[str, Any]):
+        alist_cfg = config.get("alist", {}) or {}
+        self._enable = alist_cfg.get("enable", False)
+        self._url = (alist_cfg.get("url") or "").strip().rstrip("/")
+        self._username = (alist_cfg.get("username") or "").strip()
+        self._password = (alist_cfg.get("password") or "").strip()
+        self._upload_path = (alist_cfg.get("upload_path") or "/").strip()
+        self._chunk_size = (alist_cfg.get("chunk_size_mb", 10) or 10) * 1024 * 1024
+        self._timeout = (alist_cfg.get("request_timeout", 60) or 60)
+        self._token: Optional[str] = None
+
+    @property
+    def is_enabled(self) -> bool:
+        return self._enable and bool(self._url and self._username and self._password)
+
+    async def _login(self) -> bool:
+        """登录获取 token"""
+        if not self._url:
+            return False
+        try:
+            async with aiohttp.ClientSession(timeout=aiohttp.ClientTimeout(total=self._timeout)) as session:
+                async with session.post(
+                    f"{self._url}/api/auth/login",
+                    json={"username": self._username, "password": self._password}
+                ) as resp:
+                    if resp.status != 200:
+                        return False
+                    data = await resp.json()
+                    if data.get("code") == 200:
+                        self._token = data.get("data", {}).get("token")
+                        return bool(self._token)
+        except Exception as e:
+            logger.warning("Alist 登录失败: %s", str(e))
+        return False
+
+    async def _get_headers(self) -> Optional[Dict[str, str]]:
+        """获取认证头"""
+        if not self._token:
+            if not await self._login():
+                return None
+        return {"Authorization": self._token}
+
+    async def upload_file(self, file_path: str, file_name: Optional[str] = None, share_url: Optional[str] = None) -> Optional[str]:
+        """上传单个文件，返回 Alist 链接"""
+        if not self.is_enabled:
+            return None
+        headers = await self._get_headers()
+        if not headers:
+            return None
+        if share_url:
+            md5_name = hashlib.md5(share_url.encode('utf-8')).hexdigest()
+            ext = os.path.splitext(file_name or os.path.basename(file_path))[1] or '.mp4'
+            file_name = md5_name + ext
+        else:
+            file_name = file_name or os.path.basename(file_path)
+        file_size = os.path.getsize(file_path)
+        upload_path = f"{self._upload_path.rstrip('/')}/{file_name}"
+        encoded_path = quote(upload_path, safe="/")
+        try:
+            with open(file_path, "rb") as f:
+                file_data = f.read()
+            put_headers = {
+                **headers,
+                "Content-Length": str(file_size),
+                "File-Path": encoded_path,
+                "Content-Type": "application/octet-stream",
+            }
+            async with aiohttp.ClientSession(timeout=aiohttp.ClientTimeout(total=self._timeout)) as session:
+                async with session.put(
+                    f"{self._url}/api/fs/put",
+                    headers=put_headers,
+                    data=file_data
+                ) as resp:
+                    text = await resp.text()
+                    if resp.status == 200:
+                        result = await resp.json()
+                        if result.get("code") == 200:
+                            return f"{self._url.rstrip('/')}/d{upload_path}"
+                        logger.warning("Alist 上传失败: code=%d, msg=%s", result.get("code"), result.get("message"))
+                    else:
+                        logger.warning("Alist 上传失败: HTTP %d, body=%s", resp.status, text[:200])
+        except Exception as e:
+            logger.warning("Alist 上传异常: %s", str(e))
+        return None
+
+
+async def _download_video(url: str, timeout_sec: int = 300, max_size_mb: int = 500) -> Optional[str]:
+    """下载视频文件到临时目录，返回文件路径"""
+    try:
+        async with aiohttp.ClientSession(timeout=aiohttp.ClientTimeout(total=timeout_sec)) as session:
+            async with session.get(url, headers={"User-Agent": "Mozilla/5.0"}) as resp:
+                if resp.status != 200:
+                    logger.warning("下载视频失败: HTTP %d", resp.status)
+                    return None
+                content_length = resp.headers.get('Content-Length')
+                if content_length and int(content_length) > max_size_mb * 1024 * 1024:
+                    logger.warning("视频文件太大: %.2f MB > %d MB限制", int(content_length) / 1024 / 1024, max_size_mb)
+                    return None
+                fd, temp_path = tempfile.mkstemp(suffix=".mp4", prefix="bktools_video_")
+                downloaded = 0
+                try:
+                    with os.fdopen(fd, 'wb') as f:
+                        async for chunk in resp.content.iter_chunked(8192):
+                            downloaded += len(chunk)
+                            if downloaded > max_size_mb * 1024 * 1024:
+                                logger.warning("视频超出大小限制: %.2f MB > %d MB", downloaded / 1024 / 1024, max_size_mb)
+                                os.unlink(temp_path)
+                                return None
+                            f.write(chunk)
+                    logger.info("视频下载成功: %s (%.2f MB)", temp_path, downloaded / 1024 / 1024)
+                    return temp_path
+                except Exception as e:
+                    logger.warning("写入视频临时文件失败: %s", str(e))
+                    try:
+                        os.unlink(temp_path)
+                    except Exception:
+                        pass
+                    return None
+    except Exception as e:
+        logger.warning("下载视频失败: %s", str(e))
+        return None
+
+
+async def _get_url_content_length(url: str, timeout_sec: int = 15) -> Optional[int]:
+    """通过 HEAD 请求获取远程文件大小（字节），失败返回 None"""
+    try:
+        async with aiohttp.ClientSession(
+            timeout=aiohttp.ClientTimeout(total=timeout_sec),
+            headers={"User-Agent": "Mozilla/5.0"},
+        ) as session:
+            async with session.head(url, allow_redirects=True) as resp:
+                if resp.status in (200, 206):
+                    cl = resp.headers.get("Content-Length")
+                    if cl and cl.isdigit():
+                        return int(cl)
+    except Exception as e:
+        logger.debug("获取文件大小失败: %s, url=%s", e, url)
+    return None
 
 
 def _extract_urls(text: str) -> List[str]:
@@ -191,7 +318,7 @@ def _extract_urls(text: str) -> List[str]:
     return [u.rstrip(tail_punc) for u in raw_urls if u.rstrip(tail_punc)]
 
 
-async def _download_audio(url: str, timeout_sec: int = 60) -> Optional[str]:
+async def _download_audio(url: str, timeout_sec: int = 60, max_size_mb: int = 10) -> Optional[str]:
     """下载音频文件到临时目录，返回文件路径"""
     try:
         async with aiohttp.ClientSession(timeout=aiohttp.ClientTimeout(total=timeout_sec)) as session:
@@ -199,22 +326,38 @@ async def _download_audio(url: str, timeout_sec: int = 60) -> Optional[str]:
                 if resp.status != 200:
                     logger.warning("下载音频失败: HTTP %d", resp.status)
                     return None
-                
-                # 创建临时文件
+
+                content_length = resp.headers.get('Content-Length')
+                if content_length and int(content_length) > max_size_mb * 1024 * 1024:
+                    logger.warning("音频文件太大: %.2f MB > %d MB限制", int(content_length) / 1024 / 1024, max_size_mb)
+                    return None
+
                 fd, temp_path = tempfile.mkstemp(suffix=".mp3", prefix="bktools_audio_")
                 try:
+                    downloaded = 0
                     with os.fdopen(fd, 'wb') as f:
                         async for chunk in resp.content.iter_chunked(8192):
+                            downloaded += len(chunk)
+                            if downloaded > max_size_mb * 1024 * 1024:
+                                logger.warning("音频文件超出大小限制: %d MB > %d MB", downloaded / 1024 / 1024, max_size_mb)
+                                f.close()
+                                try:
+                                    os.unlink(temp_path)
+                                except Exception:
+                                    pass
+                                return None
                             f.write(chunk)
-                    logger.info("音频下载成功: %s", temp_path)
+                    logger.info("音频下载成功: %s (%.2f MB)", temp_path, downloaded / 1024 / 1024)
                     return temp_path
                 except Exception as e:
-                    logger.error("写入临时文件失败: %s", e)
-                    if os.path.exists(temp_path):
+                    logger.warning("写入临时文件失败: %s, 路径: %s", str(e), temp_path)
+                    try:
                         os.unlink(temp_path)
+                    except Exception:
+                        pass
                     return None
     except Exception as e:
-        logger.error("下载音频失败: %s", e)
+        logger.warning("下载音频失败: %s", str(e))
         return None
 
 
@@ -253,12 +396,45 @@ def _convert_to_wav(input_path: str, max_duration_sec: int = 60) -> Optional[str
 
 def _is_qishui_url(url: str) -> bool:
     u = (url or "").lower()
-    return (
-        "qishui.douyin.com" in u
-        or "music.douyin.com" in u
-        or "qishui.com" in u
-        or "www.qishui.com" in u
-    )
+    return "qishui.douyin.com" in u or "music.douyin.com" in u or "qishui.com" in u
+
+
+# 视频自动解析域名集合（O(1) 查询）
+_VIDEO_DOMAINS = frozenset((
+    "douyin.com", "iesdouyin.com", "kuaishou.com", "xiaohongshu.com",
+    "xhslink.com", "bilibili.com", "b23.tv", "weibo.com", "weibo.cn",
+    "jimengai.com", "klingai.com", "jianying.com", "qianwen.com",
+    "doubao.com", "weixin.qq.com",
+))
+
+
+def _is_doubao_video_url(url: str) -> bool:
+    """检测是否为豆包视频链接"""
+    u = (url or "").lower()
+    return "doubao.com" in u and "/video-sharing" in u
+
+
+def _is_doubao_image_url(url: str) -> bool:
+    """检测是否为豆包对话图片链接"""
+    u = (url or "").lower()
+    return "doubao.com" in u and "/thread/" in u
+
+
+def _is_wechat_video_url(url: str) -> bool:
+    """检测是否为微信视频号链接"""
+    u = (url or "").lower()
+    return "weixin.qq.com" in u and "/sph/" in u
+
+
+def _video_auto_match(url: str) -> bool:
+    u = (url or "").lower()
+    if _is_qishui_url(u):
+        return False
+    if "doubao.com" in u and ("/video-sharing" in u or "/thread/" in u):
+        return True
+    if "weixin.qq.com" in u and "/sph/" in u:
+        return True
+    return any(d in u for d in _VIDEO_DOMAINS)
 
 
 def _music_platform(url: str) -> Optional[str]:
@@ -274,17 +450,6 @@ def _music_platform(url: str) -> Optional[str]:
     return None
 
 
-def _looks_like_qishui_share_context(text: str, url: str) -> bool:
-    if _is_qishui_url(url):
-        return True
-    u = (url or "").lower()
-    t = (text or "").lower()
-    # 常见“汽水音乐 + 抖音短链”分享文案兜底识别
-    if ("v.douyin.com" in u or "iesdouyin.com" in u) and ("汽水" in t or "qishui" in t):
-        return True
-    return False
-
-
 def _extract_netease_song_id(text: str) -> str:
     s = (text or "").strip()
     if not s:
@@ -296,27 +461,6 @@ def _extract_netease_song_id(text: str) -> str:
     return m.group(1) if m else ""
 
 
-def _video_auto_match(url: str) -> bool:
-    u = (url or "").lower()
-    # 排除汽水音乐链接
-    if _is_qishui_url(u):
-        return False
-    for h in (
-        "douyin.com",
-        "iesdouyin.com",
-        "kuaishou.com",
-        "xiaohongshu.com",
-        "xhslink.com",
-        "bilibili.com",
-        "b23.tv",
-        "weibo.com",
-        "weibo.cn",
-    ):
-        if h in u:
-            return True
-    return False
-
-
 def _is_douyin_profile_url(url: str) -> bool:
     """检测是否为抖音用户主页链接"""
     u = (url or "").lower()
@@ -325,34 +469,41 @@ def _is_douyin_profile_url(url: str) -> bool:
         if "/show/" in path_lower or "/video/" in path_lower or "/item/" in path_lower:
             return False
         return True
-    return (
-        "/user/" in u
-        or "douyin.com/user" in u
-    )
-
-
-async def _resolve_short_url(url: str, timeout_sec: int = 10) -> str:
-    """解析短链接，返回最终 URL"""
-    try:
-        headers = {"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36"}
-        async with aiohttp.ClientSession() as session:
-            async with session.get(url, allow_redirects=True, timeout=aiohttp.ClientTimeout(total=timeout_sec), headers=headers) as resp:
-                return str(resp.url)
-    except Exception:
-        return url
+    return "/user/" in u or "douyin.com/user" in u
 
 
 @register(
     "astrbot_plugin_bktools",
     "jiuhunwl",
     "BugPk 工具：短视频解析、网易云搜歌、QQ/汽水/酷我链解析",
-    "1.1.5"
+    "1.2.3"
 )
 class BKToolsPlugin(Star):
     def __init__(self, context: Context, config: Optional[Dict[str, Any]] = None):
         super().__init__(context)
         self.config: Dict[str, Any] = config if isinstance(config, dict) else {}
         self._netease_pick_cache: Dict[str, Dict[str, Any]] = {}
+        self._dedup_cache: Dict[str, float] = {}
+        self._alist: Optional[AlistUploader] = None
+
+    def _get_alist(self) -> Optional[AlistUploader]:
+        if self._alist is None:
+            self._alist = AlistUploader(self.config)
+        return self._alist if self._alist.is_enabled else None
+
+    def _check_dedup(self, url: str) -> bool:
+        """检查链接是否在去重窗口期内返回 True 表示需要跳过（已解析过）"""
+        tr = _cfg(self.config, "trigger", default={}) or {}
+        if not tr.get("dedup_enable", True):
+            return False
+        import time
+        window = tr.get("dedup_window_sec", 30)
+        now = time.time()
+        last_time = self._dedup_cache.get(url)
+        if last_time and (now - last_time) < window:
+            return True
+        self._dedup_cache[url] = now
+        return False
 
     def _debug_cfg(self) -> Tuple[bool, int]:
         d = _cfg(self.config, "debug", default={}) or {}
@@ -482,51 +633,25 @@ class BKToolsPlugin(Star):
             raw = await resp.read()
             return self._loads_response_json(raw)
 
-    async def _expand_netease_short_link(
-        self, session: aiohttp.ClientSession, link: str
-    ) -> str:
-        """展开 163cn.tv 等短链，便于提取歌曲 id。失败时返回原链接。"""
-        u = (link or "").strip()
-        if not u:
-            return u
-        low = u.lower()
-        if "163cn.tv" not in low and "y.music.163.com" not in low:
-            return u
-        try:
-            async with session.head(u, allow_redirects=True) as resp:
-                final_u = str(resp.url)
-                if final_u:
-                    return final_u
-        except Exception:
-            pass
-        try:
-            async with session.get(u, allow_redirects=True) as resp:
-                final_u = str(resp.url)
-                if final_u:
-                    return final_u
-        except Exception:
-            pass
-        return u
-
-    async def _resolve_final_url(
-        self, session: aiohttp.ClientSession, link: str
-    ) -> str:
-        """通用重定向展开（用于汽水等分享短链识别）。"""
-        u = (link or "").strip()
+    async def _resolve_url_redirect(self, url: str, timeout_sec: int = 10) -> str:
+        """通用重定向展开（用于短链接解析）。失败时返回原链接。"""
+        u = (url or "").strip()
         if not u:
             return u
         try:
-            async with session.head(u, allow_redirects=True) as resp:
-                final_u = str(resp.url)
-                if final_u:
-                    return final_u
+            async with aiohttp.ClientSession() as session:
+                async with session.head(u, allow_redirects=True, timeout=aiohttp.ClientTimeout(total=timeout_sec)) as resp:
+                    final_u = str(resp.url)
+                    if final_u:
+                        return final_u
         except Exception:
             pass
         try:
-            async with session.get(u, allow_redirects=True) as resp:
-                final_u = str(resp.url)
-                if final_u:
-                    return final_u
+            async with aiohttp.ClientSession() as session:
+                async with session.get(u, allow_redirects=True, timeout=aiohttp.ClientTimeout(total=timeout_sec)) as resp:
+                    final_u = str(resp.url)
+                    if final_u:
+                        return final_u
         except Exception:
             pass
         return u
@@ -632,6 +757,12 @@ class BKToolsPlugin(Star):
         pack_include_cover = bool(msg_cfg.get("pack_include_cover", True))
         text_meta = bool(msg_cfg.get("short_video_text_metadata", True))
 
+        # 视频文件大小阈值控制
+        vth = _cfg(self.config, "video_threshold", default={}) or {}
+        force_link = bool(vth.get("force_link_enabled", False))
+        threshold_on = bool(vth.get("threshold_enabled", True))
+        threshold_mb = int(vth.get("threshold_mb", 100) or 100)
+
         include_video_line = True
         if video_urls and pack_send_video:
             include_video_line = False
@@ -653,10 +784,66 @@ class BKToolsPlugin(Star):
                 ci = _make_image_node(cover_s)
                 if ci:
                     chain.append(ci)
+            alist = self._get_alist()
+            upload_only = alist.is_enabled and _cfg(self.config, "alist", "upload_only", default=False) if alist else False
             for vu in video_urls:
                 if pack_send_video:
-                    vn = _make_video_node(vu)
-                    chain.append(vn if vn is not None else Plain(f"视频：{vu}"))
+                    # 阈值检查：决定是否应发送链接而非直接传输视频文件
+                    vu_str = str(vu).strip()
+                    send_as_link = False
+                    if force_link:
+                        # 全局强制链接发送开关开启，直接发送链接
+                        send_as_link = True
+                        logger.info("视频阈值: 全局强制链接发送开关已启用，使用链接发送: %s", vu_str)
+                    elif threshold_on:
+                        # 阈值开关开启，检测文件大小
+                        try:
+                            file_size = await _get_url_content_length(vu_str)
+                            if file_size is not None:
+                                size_mb = file_size / (1024 * 1024)
+                                if size_mb > threshold_mb:
+                                    send_as_link = True
+                                    logger.info(
+                                        "视频阈值: 文件大小 %.2f MB 超过阈值 %d MB，使用链接发送: %s",
+                                        size_mb, threshold_mb, vu_str,
+                                    )
+                                else:
+                                    logger.info(
+                                        "视频阈值: 文件大小 %.2f MB 未超过阈值 %d MB，正常发送: %s",
+                                        size_mb, threshold_mb, vu_str,
+                                    )
+                            else:
+                                logger.warning("视频阈值: 无法获取文件大小，按正常流程发送: %s", vu_str)
+                        except Exception as e:
+                            logger.warning("视频阈值: 检测文件大小异常: %s，按正常流程发送: %s", e, vu_str)
+
+                    if send_as_link:
+                        chain.append(Plain(f"视频：{vu_str}"))
+                    elif alist:
+                        try:
+                            temp_video = await _download_video(vu_str)
+                            if temp_video:
+                                alist_url = await alist.upload_file(temp_video, share_url=vu_str)
+                                if alist_url:
+                                    chain.append(Plain(alist_url))
+                                    if not upload_only:
+                                        vn = _make_video_node(vu_str)
+                                        if vn:
+                                            chain.append(vn)
+                                else:
+                                    chain.append(Plain(f"视频：{vu_str}"))
+                                try:
+                                    os.unlink(temp_video)
+                                except Exception:
+                                    pass
+                            else:
+                                chain.append(Plain(f"视频：{vu_str}"))
+                        except Exception as e:
+                            logger.warning("Alist 上传失败: %s", str(e))
+                            chain.append(Plain(f"视频：{str(vu).strip()}"))
+                    else:
+                        vn = _make_video_node(vu_str)
+                        chain.append(vn if vn is not None else Plain(f"视频：{vu_str}"))
                 else:
                     chain.append(Plain(f"视频：{vu}"))
         else:
@@ -677,15 +864,9 @@ class BKToolsPlugin(Star):
 
         pack = bool(msg_cfg.get("pack_forward", True))
         name, uid = self._bot_identity(event)
-        batch_gallery = _is_pure_image_gallery_nodes(chain) and not av_s
 
         if pack:
-            flat = _chain_to_forward_nodes(
-                chain,
-                name,
-                uid,
-                batch_pure_image_gallery=batch_gallery,
-            )
+            flat = _chain_to_forward_nodes(chain, name, uid)
             if flat:
                 try:
                     await event.send(event.chain_result([Nodes(flat)]))
@@ -830,7 +1011,7 @@ class BKToolsPlugin(Star):
 
         pack = bool(msg_cfg.get("pack_forward", True))
         if pack and nodes:
-            flat = _chain_to_forward_nodes(nodes, name, uid, batch_pure_image_gallery=False)
+            flat = _chain_to_forward_nodes(nodes, name, uid)
             if flat:
                 await event.send(event.chain_result([Nodes(flat)]))
         else:
@@ -952,9 +1133,8 @@ class BKToolsPlugin(Star):
         req_link = link
         try:
             async with aiohttp.ClientSession(timeout=to, headers=headers) as session:
-                # 未识别平台时尝试展开短链（如 v.douyin.com -> qishui.douyin.com）
                 if not plat:
-                    resolved = await self._resolve_final_url(session, req_link)
+                    resolved = await self._resolve_url_redirect(req_link)
                     if resolved:
                         req_link = resolved
                         plat = _music_platform(req_link)
@@ -1161,7 +1341,8 @@ class BKToolsPlugin(Star):
         if msg_cfg.get("send_voice_message") and audio:
             try:
                 logger.info("尝试发送语音消息: %s", audio)
-                temp_audio = await _download_audio(str(audio), timeout_sec=self._http_cfg()[0])
+                max_size_mb = int(msg_cfg.get("voice_max_size_mb", 10))
+                temp_audio = await _download_audio(str(audio), timeout_sec=self._http_cfg()[0], max_size_mb=max_size_mb)
                 if temp_audio:
                     wav_path = _convert_to_wav(temp_audio, max_duration_sec=int(msg_cfg.get("voice_max_duration", 60)))
                     if wav_path and os.path.exists(wav_path):
@@ -1292,6 +1473,27 @@ class BKToolsPlugin(Star):
             return
         await self._music_link_parse(event, arg)
 
+    @filter.command("bk清理缓存")
+    async def cmd_cleanup_cache(self, event: AstrMessageEvent):
+        """清理本插件的临时缓存文件"""
+        try:
+            cache_dir = tempfile.gettempdir()
+            prefix = "bktools_audio_"
+            count = 0
+            size = 0
+            for f in os.listdir(cache_dir):
+                if f.startswith(prefix):
+                    path = os.path.join(cache_dir, f)
+                    try:
+                        size += os.path.getsize(path)
+                        os.unlink(path)
+                        count += 1
+                    except Exception:
+                        pass
+            await event.send(event.plain_result(f"已清理 {count} 个缓存文件，释放 {size / 1024 / 1024:.2f} MB"))
+        except Exception as e:
+            await event.send(event.plain_result(f"清理失败: {str(e)}"))
+
     @filter.event_message_type(EventMessageType.ALL)
     async def on_auto(self, event: AstrMessageEvent):
         """自动触发短视频 / 音乐链"""
@@ -1313,17 +1515,24 @@ class BKToolsPlugin(Star):
 
         resolved_urls = []
         for u in urls:
-            resolved = await _resolve_short_url(u)
+            resolved = await self._resolve_url_redirect(u)
             resolved_urls.append(resolved)
+
+        def _matched(check_fn, orig, resolved):
+            return check_fn(resolved) or (orig != resolved and check_fn(orig))
 
         for i, resolved in enumerate(resolved_urls):
             orig = urls[i]
 
             if tr.get("auto_music_link"):
-                if _is_qishui_url(orig) or _is_qishui_url(resolved):
+                if _is_qishui_url(resolved) or _matched(_is_qishui_url, orig, resolved):
+                    if self._check_dedup(orig):
+                        return
                     await self._music_link_parse(event, orig)
                     return
-                if _music_platform(resolved) or (orig != resolved and _music_platform(orig)):
+                if _matched(_music_platform, orig, resolved):
+                    if self._check_dedup(orig):
+                        return
                     await self._music_link_parse(event, orig)
                     return
 
@@ -1331,7 +1540,9 @@ class BKToolsPlugin(Star):
             orig = urls[i]
 
             if tr.get("auto_douyin_profile"):
-                if _is_douyin_profile_url(resolved) or (orig != resolved and _is_douyin_profile_url(orig)):
+                if _matched(_is_douyin_profile_url, orig, resolved):
+                    if self._check_dedup(orig):
+                        return
                     await self._reply_douyin_profile(event, orig)
                     return
 
@@ -1339,7 +1550,8 @@ class BKToolsPlugin(Star):
             orig = urls[i]
 
             if tr.get("auto_short_video"):
-                if _video_auto_match(resolved) or (orig != resolved and _video_auto_match(orig)):
-                    if not _is_douyin_profile_url(resolved):
-                        await self._reply_short_video(event, orig)
+                if _matched(_video_auto_match, orig, resolved) and not _is_douyin_profile_url(resolved):
+                    if self._check_dedup(orig):
                         return
+                    await self._reply_short_video(event, orig)
+                    return

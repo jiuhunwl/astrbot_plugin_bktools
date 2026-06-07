@@ -462,10 +462,73 @@
       "send_voice_message": {
         "description": "音乐解析：是否发送语音消息（需要安装 pydub 和 ffmpeg）",
         "type": "bool",
-        "default": false
+        "default": true
       },
       "voice_max_duration": {
         "description": "语音消息最大时长（秒），超过将自动截断",
+        "type": "int",
+        "default": 60
+      },
+      "voice_max_size_mb": {
+        "description": "音频文件最大大小（MB），超过将不发送语音消息",
+        "type": "int",
+        "default": 10
+      }
+    }
+  },
+  "cache": {
+    "description": "缓存管理",
+    "type": "object",
+    "items": {
+      "temp_prefix": {
+        "description": "临时文件前缀（清理缓存时识别用）",
+        "type": "string",
+        "default": "bktools_audio_",
+        "invisible": true
+      }
+    }
+  },
+  "alist": {
+    "description": "Alist 文件上传（用于视频分片上传加速）",
+    "type": "object",
+    "items": {
+      "enable": {
+        "description": "启用 Alist 上传功能",
+        "type": "bool",
+        "default": false
+      },
+      "upload_only": {
+        "description": "仅上传直链（不发送视频文件）",
+        "type": "bool",
+        "default": false
+      },
+      "url": {
+        "description": "Alist 地址（如 https://alist.example.com）",
+        "type": "string",
+        "default": ""
+      },
+      "username": {
+        "description": "Alist 用户名",
+        "type": "string",
+        "default": ""
+      },
+      "password": {
+        "description": "Alist 密码",
+        "type": "string",
+        "default": ""
+      },
+      "upload_path": {
+        "description": "上传目录路径（如 /视频分享）",
+        "type": "string",
+        "default": "/"
+      },
+      "chunk_size_mb": {
+        "description": "分片大小（MB），建议 5-50",
+        "type": "int",
+        "default": 10
+      },
+      "request_timeout": {
+        "description": "请求超时时间（秒）",
         "type": "int",
         "default": 60
       }
@@ -483,12 +546,43 @@
       "auto_music_link": {
         "description": "消息中出现音乐平台分享链接时自动链解析（仅链接，无搜索）",
         "type": "bool",
-        "default": false
+        "default": true
       },
       "auto_douyin_profile": {
         "description": "消息中出现抖音用户主页链接时自动解析",
         "type": "bool",
+        "default": true
+      },
+      "dedup_enable": {
+        "description": "启用链接去重（同链接短时间内只解析一次）",
+        "type": "bool",
+        "default": true
+      },
+      "dedup_window_sec": {
+        "description": "去重时间窗口（秒），此时间内相同链接不会重复解析",
+        "type": "int",
+        "default": 30
+      }
+    }
+  },
+  "video_threshold": {
+    "description": "视频文件大小阈值控制（超过阈值自动发送链接而非直接传输）",
+    "type": "object",
+    "items": {
+      "force_link_enabled": {
+        "description": "全局强制链接发送总开关（优先级最高，启用时无论文件大小如何均直接发送链接）",
+        "type": "bool",
         "default": false
+      },
+      "threshold_enabled": {
+        "description": "阈值触发链接发送功能开关（仅在全局总开关关闭时生效）",
+        "type": "bool",
+        "default": true
+      },
+      "threshold_mb": {
+        "description": "文件大小阈值（MB），超过此大小的视频将发送链接而非直接传输",
+        "type": "int",
+        "default": 100
       }
     }
   }
