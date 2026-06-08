@@ -585,5 +585,26 @@
         "default": 100
       }
     }
+  },
+  "batch_output": {
+    "description": "批量内容输出控制（图集/实况超过数量时直接输出JSON）",
+    "type": "object",
+    "items": {
+      "direct_json_enabled": {
+        "description": "启用直接输出JSON功能（图集或实况数量超过阈值时生效）",
+        "type": "bool",
+        "default": false
+      },
+      "image_count_threshold": {
+        "description": "图集数量阈值（超过此数量时直接输出JSON）",
+        "type": "int",
+        "default": 20
+      },
+      "live_photo_count_threshold": {
+        "description": "实况（多段视频）数量阈值（超过此数量时直接输出JSON）",
+        "type": "int",
+        "default": 10
+      }
+    }
   }
 }

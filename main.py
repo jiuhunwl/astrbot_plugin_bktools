@@ -476,7 +476,7 @@ def _is_douyin_profile_url(url: str) -> bool:
     "astrbot_plugin_bktools",
     "jiuhunwl",
     "BugPk 工具：短视频解析、网易云搜歌、QQ/汽水/酷我链解析",
-    "1.2.3"
+    "1.2.6"
 )
 class BKToolsPlugin(Star):
     def __init__(self, context: Context, config: Optional[Dict[str, Any]] = None):
@@ -485,6 +485,8 @@ class BKToolsPlugin(Star):
         self._netease_pick_cache: Dict[str, Dict[str, Any]] = {}
         self._dedup_cache: Dict[str, float] = {}
         self._alist: Optional[AlistUploader] = None
+        self._stop_parsing_flag: bool = False
+        self._parsing_lock: Dict[str, bool] = {}  # 解析锁，防止同一链接重复解析
 
     def _get_alist(self) -> Optional[AlistUploader]:
         if self._alist is None:
@@ -721,6 +723,9 @@ class BKToolsPlugin(Star):
         return "\n".join(lines) if lines else "（无文本信息）"
 
     async def _reply_short_video(self, event: AstrMessageEvent, link: str) -> None:
+        # 重置停止标志
+        self._stop_parsing_flag = False
+        
         await self._maybe_opening(event)
         try:
             j, data = await self._fetch_short_video(link)
@@ -728,6 +733,13 @@ class BKToolsPlugin(Star):
             logger.warning("短视频解析失败: %s，链接: %s", e, link)
             await event.send(event.plain_result(f"短视频解析失败：{e}"))
             return
+        
+        # 检查停止标志
+        if self._stop_parsing_flag:
+            logger.info("解析已被强制停止")
+            await event.send(event.plain_result("解析已被强制停止"))
+            return
+        
         cfg_sv = _cfg(self.config, "short_video", default={}) or {}
         msg_cfg = _cfg(self.config, "message", default={}) or {}
 
@@ -742,11 +754,33 @@ class BKToolsPlugin(Star):
 
         imgs = _rel_data(data, cfg_sv.get("path_images_list") or "images", j)
         img_list: List[str] = []
+        img_total_count = 0
         if isinstance(imgs, list):
+            img_total_count = len(imgs)
             lim = int(msg_cfg.get("max_images_per_work", 9) or 9)
             for x in imgs[:lim]:
                 if x:
                     img_list.append(str(x).strip())
+
+        # 批量输出控制：检查图集/实况数量是否超过阈值
+        batch_cfg = _cfg(self.config, "batch_output", default={}) or {}
+        direct_json_enabled = bool(batch_cfg.get("direct_json_enabled", False))
+        img_threshold = int(batch_cfg.get("image_count_threshold", 20))
+        live_threshold = int(batch_cfg.get("live_photo_count_threshold", 10))
+        
+        if direct_json_enabled:
+            live_count = len(live_vs)
+            if img_total_count > img_threshold or live_count > live_threshold:
+                logger.info(
+                    "批量输出: 图集数量(%d)超过阈值(%d)或实况数量(%d)超过阈值(%d)，直接输出JSON",
+                    img_total_count, img_threshold, live_count, live_threshold
+                )
+                try:
+                    json_str = json.dumps(j, ensure_ascii=False, indent=2)
+                    await event.send(event.plain_result(json_str))
+                    return
+                except Exception as e:
+                    logger.warning("输出JSON失败: %s", str(e))
 
         cover = _rel_data(data, cfg_sv.get("path_cover") or "cover", j)
         cover_s = str(cover).strip() if cover else ""
@@ -780,6 +814,12 @@ class BKToolsPlugin(Star):
             chain.append(Plain("解析完成"))
 
         if video_urls:
+            # 检查停止标志
+            if self._stop_parsing_flag:
+                logger.info("解析已被强制停止")
+                await event.send(event.plain_result("解析已被强制停止"))
+                return
+                
             if pack_include_cover and cover_s:
                 ci = _make_image_node(cover_s)
                 if ci:
@@ -787,6 +827,12 @@ class BKToolsPlugin(Star):
             alist = self._get_alist()
             upload_only = alist.is_enabled and _cfg(self.config, "alist", "upload_only", default=False) if alist else False
             for vu in video_urls:
+                # 检查停止标志
+                if self._stop_parsing_flag:
+                    logger.info("解析已被强制停止")
+                    await event.send(event.plain_result("解析已被强制停止"))
+                    return
+                    
                 if pack_send_video:
                     # 阈值检查：决定是否应发送链接而非直接传输视频文件
                     vu_str = str(vu).strip()
@@ -845,9 +891,15 @@ class BKToolsPlugin(Star):
                         vn = _make_video_node(vu_str)
                         chain.append(vn if vn is not None else Plain(f"视频：{vu_str}"))
                 else:
-                    chain.append(Plain(f"视频：{vu}"))
+                    chain.append(Plain(f"视频：{vu_str}"))
         else:
             for u in img_list:
+                # 检查停止标志
+                if self._stop_parsing_flag:
+                    logger.info("解析已被强制停止")
+                    await event.send(event.plain_result("解析已被强制停止"))
+                    return
+                    
                 im = _make_image_node(u)
                 if im:
                     chain.append(im)
@@ -1494,6 +1546,12 @@ class BKToolsPlugin(Star):
         except Exception as e:
             await event.send(event.plain_result(f"清理失败: {str(e)}"))
 
+    @filter.command("bk停止解析")
+    async def cmd_stop_parsing(self, event: AstrMessageEvent):
+        """强制停止当前解析任务并截断输出"""
+        self._stop_parsing_flag = True
+        await event.send(event.plain_result("已强制停止解析"))
+
     @filter.event_message_type(EventMessageType.ALL)
     async def on_auto(self, event: AstrMessageEvent):
         """自动触发短视频 / 音乐链"""
@@ -1510,7 +1568,9 @@ class BKToolsPlugin(Star):
         urls = _extract_urls(text)
         if not urls:
             return
-        if text.strip().startswith("/bk"):
+        # 拦截命令消息，避免命令处理器和自动触发重复执行
+        text_stripped = text.strip()
+        if text_stripped.startswith("/bk") or text_stripped.startswith("bk"):
             return
 
         resolved_urls = []
@@ -1526,14 +1586,34 @@ class BKToolsPlugin(Star):
 
             if tr.get("auto_music_link"):
                 if _is_qishui_url(resolved) or _matched(_is_qishui_url, orig, resolved):
-                    if self._check_dedup(orig):
+                    # 使用解析锁防止重复解析
+                    lock_key = f"music_link:{orig}"
+                    if self._parsing_lock.get(lock_key):
+                        logger.info("音乐链接解析任务已在进行中，跳过: %s", orig)
                         return
-                    await self._music_link_parse(event, orig)
+                    self._parsing_lock[lock_key] = True
+                    if self._check_dedup(orig):
+                        self._parsing_lock[lock_key] = False
+                        return
+                    try:
+                        await self._music_link_parse(event, orig)
+                    finally:
+                        self._parsing_lock[lock_key] = False
                     return
                 if _matched(_music_platform, orig, resolved):
-                    if self._check_dedup(orig):
+                    # 使用解析锁防止重复解析
+                    lock_key = f"music_link:{orig}"
+                    if self._parsing_lock.get(lock_key):
+                        logger.info("音乐链接解析任务已在进行中，跳过: %s", orig)
                         return
-                    await self._music_link_parse(event, orig)
+                    self._parsing_lock[lock_key] = True
+                    if self._check_dedup(orig):
+                        self._parsing_lock[lock_key] = False
+                        return
+                    try:
+                        await self._music_link_parse(event, orig)
+                    finally:
+                        self._parsing_lock[lock_key] = False
                     return
 
         for i, resolved in enumerate(resolved_urls):
@@ -1541,9 +1621,19 @@ class BKToolsPlugin(Star):
 
             if tr.get("auto_douyin_profile"):
                 if _matched(_is_douyin_profile_url, orig, resolved):
-                    if self._check_dedup(orig):
+                    # 使用解析锁防止重复解析
+                    lock_key = f"douyin_profile:{orig}"
+                    if self._parsing_lock.get(lock_key):
+                        logger.info("抖音主页解析任务已在进行中，跳过: %s", orig)
                         return
-                    await self._reply_douyin_profile(event, orig)
+                    self._parsing_lock[lock_key] = True
+                    if self._check_dedup(orig):
+                        self._parsing_lock[lock_key] = False
+                        return
+                    try:
+                        await self._reply_douyin_profile(event, orig)
+                    finally:
+                        self._parsing_lock[lock_key] = False
                     return
 
         for i, resolved in enumerate(resolved_urls):
@@ -1551,7 +1641,17 @@ class BKToolsPlugin(Star):
 
             if tr.get("auto_short_video"):
                 if _matched(_video_auto_match, orig, resolved) and not _is_douyin_profile_url(resolved):
-                    if self._check_dedup(orig):
+                    # 使用解析锁防止重复解析
+                    lock_key = f"short_video:{orig}"
+                    if self._parsing_lock.get(lock_key):
+                        logger.info("短视频解析任务已在进行中，跳过: %s", orig)
                         return
-                    await self._reply_short_video(event, orig)
+                    self._parsing_lock[lock_key] = True
+                    if self._check_dedup(orig):
+                        self._parsing_lock[lock_key] = False
+                        return
+                    try:
+                        await self._reply_short_video(event, orig)
+                    finally:
+                        self._parsing_lock[lock_key] = False
                     return
