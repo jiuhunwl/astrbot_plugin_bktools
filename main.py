@@ -2007,13 +2007,14 @@ class BKToolsPlugin(Star):
         def _matched(check_fn, orig, resolved):
             return check_fn(resolved) or (orig != resolved and check_fn(orig))
 
+        runtime_scope = self._runtime_scope()
         for i, resolved in enumerate(resolved_urls):
             orig = urls[i]
 
-            if tr.get("auto_music_link"):
+            if self._feature_enabled("music") and tr.get("auto_music_link"):
                 if _is_qishui_url(resolved) or _matched(_is_qishui_url, orig, resolved):
                     # 使用解析锁防止重复解析
-                    lock_key = f"music_link:{orig}"
+                    lock_key = f"{runtime_scope}:music_link:{orig}"
                     if self._parsing_lock.get(lock_key):
                         logger.info("音乐链接解析任务已在进行中，跳过: %s", orig)
                         return
@@ -2028,7 +2029,7 @@ class BKToolsPlugin(Star):
                     return
                 if _matched(_music_platform, orig, resolved):
                     # 使用解析锁防止重复解析
-                    lock_key = f"music_link:{orig}"
+                    lock_key = f"{runtime_scope}:music_link:{orig}"
                     if self._parsing_lock.get(lock_key):
                         logger.info("音乐链接解析任务已在进行中，跳过: %s", orig)
                         return
@@ -2045,10 +2046,10 @@ class BKToolsPlugin(Star):
         for i, resolved in enumerate(resolved_urls):
             orig = urls[i]
 
-            if tr.get("auto_douyin_profile"):
+            if self._feature_enabled("douyin_profile") and tr.get("auto_douyin_profile"):
                 if _matched(_is_douyin_profile_url, orig, resolved):
                     # 使用解析锁防止重复解析
-                    lock_key = f"douyin_profile:{orig}"
+                    lock_key = f"{runtime_scope}:douyin_profile:{orig}"
                     if self._parsing_lock.get(lock_key):
                         logger.info("抖音主页解析任务已在进行中，跳过: %s", orig)
                         return
@@ -2065,10 +2066,10 @@ class BKToolsPlugin(Star):
         for i, resolved in enumerate(resolved_urls):
             orig = urls[i]
 
-            if tr.get("auto_short_video"):
+            if self._feature_enabled("short_video") and tr.get("auto_short_video"):
                 if _matched(_video_auto_match, orig, resolved) and not _is_douyin_profile_url(resolved):
                     # 使用解析锁防止重复解析
-                    lock_key = f"short_video:{orig}"
+                    lock_key = f"{runtime_scope}:short_video:{orig}"
                     if self._parsing_lock.get(lock_key):
                         logger.info("短视频解析任务已在进行中，跳过: %s", orig)
                         return
