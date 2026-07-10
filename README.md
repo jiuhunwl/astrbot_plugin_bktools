@@ -56,55 +56,30 @@
 | `/bk点歌` | `/bk点歌 1` | 从最近一次搜索结果中点歌 |
 | `/bk音乐` | `/bk音乐 <分享链接>` | 解析音乐平台分享链接 |
 | `/bk清理缓存` | `/bk清理缓存` | 清理本插件的临时缓存文件 |
+| `/bk停止解析` | `/bk停止解析` | 停止当前正在运行的短视频/主页解析并截断后续输出 |
 
 补充说明：
 
 - 搜歌后可直接发送数字（如 `1`）快速点歌
 - 非网易云平台请发送官方分享链接进行解析
 - 可开启自动触发，无需每次手动输入命令
+- 开启合并转发后，发送失败会按配置自动重试；全部失败时仅发送接口返回的完整 JSON，不会退化为逐作品发送
 
 ---
 
 ## 配置说明
 
-插件配置来自 `_conf_schema.json`，WebUI 中主要分为以下模块：
+插件配置来自 `_conf_schema.json`。设置页按照实际使用频率重新排序：
 
-### `short_video`（短视频）
+1. `trigger`：自动解析短视频、主页和音乐链接，以及链接去重。
+2. `message`：解析提示、合并转发重试、媒体展示数量、原始链接和音乐语音消息。
+3. `short_video`：短视频接口地址；自定义字段路径通过“显示高级字段映射”展开。
+4. `video_threshold` / `batch_output`：大视频发送策略与大量图集、实况的 JSON 输出策略。
+5. `netease` / `link_only_music`：网易云搜索解析及 QQ、汽水、酷我音乐接口。
+6. `alist`：可选的 Alist 视频上传配置，关闭时自动隐藏账号与上传参数。
+7. `http` / `debug`：请求超时、User-Agent 与排错日志。
 
-- `endpoint`：短视频解析接口
-- `url_param_name`：链接参数名（通常为 `url`）
-- `path_*`：返回 JSON 字段路径（状态码、标题、作者、封面、视频、图集等）
-
-### `netease`（网易云）
-
-- `search_endpoint`：网易云搜索接口
-- `search_extra_params_json`：搜索附加参数
-- `search_list_path` 与歌曲字段路径
-- `link_parse_endpoint`：网易云链接解析接口（可与搜索接口相同）
-- `parse_*`：歌曲名、作者、封面、音频、歌词等字段路径
-
-### `link_only_music`（链接解析）
-
-- `qq_endpoint`、`qishui_endpoint`、`kuwo_endpoint` 等平台接口
-- 各平台 `data` 下标题、作者、封面、音频、歌词字段路径
-
-### `message`（消息行为）
-
-- `opening_enable` / `opening_text`：开场语
-- `pack_forward`：是否消息集合转发
-- `pack_send_video`：是否使用视频节点发送
-- `pack_include_cover` / `pack_append_original_link`：附带封面/原链接
-- `max_images_per_work`、`search_result_limit`：条数控制
-
-### `trigger`（自动触发）
-
-- `auto_short_video`：自动短视频解析
-- `auto_music_link`：自动音乐链接解析
-
-### `http`
-
-- `timeout_sec`：请求超时
-- `user_agent`：请求 UA
+设置页支持动态显示：关闭某项功能后，与它相关的参数会自动隐藏；接口字段映射默认不展开，普通用户通常只需确认接口地址即可。数值配置使用滑块与数字输入组合，JSON 附加参数提供代码编辑器。
 
 ---
 

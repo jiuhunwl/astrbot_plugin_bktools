@@ -1,609 +1,1076 @@
 {
-  "short_video": {
-    "description": "短视频解析（BugPk 等，单 url 参数）",
+  "trigger": {
+    "description": "⚡ 自动解析与去重",
     "type": "object",
+    "hint": "控制插件在聊天中自动识别哪些链接，以及如何避免同一链接被重复解析。",
     "items": {
-      "endpoint": {
-        "description": "接口地址（不含 ?后参数）",
-        "type": "string",
-        "default": "https://api.bugpk.com/api/short_videos",
-        "hint": "与 BugPk 文档一致，如 short_videos、douyin 等"
-      },
-      "url_param_name": {
-        "description": "链接查询参数名",
-        "type": "string",
-        "default": "url"
-      },
-      "request_method": {
-        "description": "请求方法",
-        "type": "string",
-        "options": ["GET", "POST"],
-        "default": "GET"
-      },
-      "path_code": {
-        "description": "业务码 JSON 路径",
-        "type": "string",
-        "default": "code"
-      },
-      "success_codes": {
-        "description": "成功 code列表（逗号分隔，可填200 或 200,0）",
-        "type": "string",
-        "default": "200"
-      },
-      "path_msg": {
-        "description": "提示信息路径",
-        "type": "string",
-        "default": "msg"
-      },
-      "path_data_root": {
-        "description": "作品数据根路径（在其下取标题、作者等）",
-        "type": "string",
-        "default": "data"
-      },
-      "path_title": {
-        "description": "标题（相对 data 根，或留空表示与根同级的绝对路径写法见下）",
-        "type": "string",
-        "default": "title"
-      },
-      "path_desc": {
-        "description": "文案/描述",
-        "type": "string",
-        "default": "desc"
-      },
-      "path_type": {
-        "description": "类型 video/image/live",
-        "type": "string",
-        "default": "type"
-      },
-      "path_author_name": {
-        "description": "作者昵称（支持 data.author.name 这种，若以 data. 开头则从根对象取）",
-        "type": "string",
-        "default": "author.name"
-      },
-      "path_author_avatar": {
-        "description": "作者头像 URL",
-        "type": "string",
-        "default": "author.avatar"
-      },
-      "path_cover": {
-        "description": "封面 URL",
-        "type": "string",
-        "default": "cover"
-      },
-      "path_video_url": {
-        "description": "视频直链",
-        "type": "string",
-        "default": "url"
-      },
-      "path_video_backup_list": {
-        "description": "备用视频 URL 列表（无直链时取第一项）",
-        "type": "string",
-        "default": "video_backup"
-      },
-      "path_images_list": {
-        "description": "图集 URL 列表",
-        "type": "string",
-        "default": "images"
-      },
-      "path_music_title": {
-        "description": "背景音乐标题",
-        "type": "string",
-        "default": "music.title"
-      },
-      "path_music_author": {
-        "description": "背景音乐作者",
-        "type": "string",
-        "default": "music.author"
-      },
-      "path_music_url": {
-        "description": "背景音乐直链",
-        "type": "string",
-        "default": "music.url"
-      },
-      "path_live_photo_list": {
-        "description": "实况/多段视频列表路径（如抖音 live_photo 数组）",
-        "type": "string",
-        "default": "live_photo"
-      },
-      "path_live_photo_video": {
-        "description": "实况项内视频 URL 相对字段",
-        "type": "string",
-        "default": "video"
-      }
-    }
-  },
-  "netease": {
-    "description": "网易云：用于关键词搜索与链接解析（可分别配置接口地址与字段路径）。",
-    "type": "object",
-    "items": {
-      "search_endpoint": {
-        "description": "网易云搜索接口地址",
-        "type": "string",
-        "default": "https://api.bugpk.com/api/163_music",
-        "hint": "默认值为 BugPk 163_music；留空则关键词搜歌不可用。"
-      },
-      "search_method": {
-        "description": "搜索请求方法",
-        "type": "string",
-        "options": ["GET", "POST"],
-        "default": "GET"
-      },
-      "search_keyword_param": {
-        "description": "搜索关键词的查询参数名",
-        "type": "string",
-        "default": "keywords"
-      },
-      "search_extra_params_json": {
-        "description": "搜索时固定附加参数（JSON 对象字符串）",
-        "type": "string",
-        "default": "{\"type\":\"search\",\"limit\":10,\"offset\":0}",
-        "hint": "关键词由插件填入；其余参数按你的接口需求调整。"
-      },
-      "search_path_code": {
-        "description": "搜索响应 code 路径",
-        "type": "string",
-        "default": "code"
-      },
-      "search_success_codes": {
-        "description": "搜索成功 code",
-        "type": "string",
-        "default": "200"
-      },
-      "search_path_msg": {
-        "description": "搜索响应 msg 路径",
-        "type": "string",
-        "default": "msg"
-      },
-      "search_list_path": {
-        "description": "搜索结果列表路径（从 JSON 根开始）",
-        "type": "string",
-        "default": "data.songs",
-        "hint": "默认读取 data.songs；按你的接口返回结构调整。"
-      },
-      "search_item_name": {
-        "description": "单曲项：歌名（相对列表每一项）",
-        "type": "string",
-        "default": "name"
-      },
-      "search_item_artist": {
-        "description": "单曲项：歌手（文档为字符串 artists）",
-        "type": "string",
-        "default": "artists"
-      },
-      "search_item_id": {
-        "description": "单曲项：歌曲 id",
-        "type": "string",
-        "default": "id"
-      },
-      "search_item_album": {
-        "description": "单曲项：专辑名（可选）",
-        "type": "string",
-        "default": "album"
-      },
-      "link_parse_endpoint": {
-        "description": "网易云链接解析接口地址（留空则使用 search_endpoint）",
-        "type": "string",
-        "default": "https://api.bugpk.com/api/163_music",
-        "hint": "留空则自动使用 search_endpoint。"
-      },
-      "link_url_param": {
-        "description": "链接解析时 url 参数名",
-        "type": "string",
-        "default": "url"
-      },
-      "link_method": {
-        "description": "链接解析请求方法",
-        "type": "string",
-        "options": ["GET", "POST"],
-        "default": "GET"
-      },
-      "link_parse_extra_params_json": {
-        "description": "链接解析时附加查询/表单参数（JSON 对象字符串）",
-        "type": "string",
-        "default": "{\"type\":\"json\",\"level\":\"standard\"}",
-        "hint": "默认包含 level；按你的接口需求调整。"
-      },
-      "parse_path_code": {
-        "description": "解析响应 code 路径",
-        "type": "string",
-        "default": "code"
-      },
-      "parse_success_codes": {
-        "description": "解析成功 code",
-        "type": "string",
-        "default": "200"
-      },
-      "parse_path_msg": {
-        "description": "解析 msg 路径",
-        "type": "string",
-        "default": "msg"
-      },
-      "parse_data_root": {
-        "description": "解析数据根路径",
-        "type": "string",
-        "default": "data"
-      },
-      "parse_title": {
-        "description": "解析：标题（相对 data 根）",
-        "type": "string",
-        "default": "name"
-      },
-      "parse_author": {
-        "description": "解析：作者",
-        "type": "string",
-        "default": "ar_name"
-      },
-      "parse_cover": {
-        "description": "解析：封面",
-        "type": "string",
-        "default": "pic"
-      },
-      "parse_audio_url": {
-        "description": "解析：音频直链",
-        "type": "string",
-        "default": "url"
-      },
-      "parse_lyric": {
-        "description": "解析：歌词（可选）",
-        "type": "string",
-        "default": "lyric"
-      },
-      "parse_album": {
-        "description": "解析：专辑名",
-        "type": "string",
-        "default": "al_name"
-      },
-      "parse_size": {
-        "description": "解析：文件大小展示字段",
-        "type": "string",
-        "default": "size"
-      },
-      "parse_quality": {
-        "description": "解析：音质说明字段",
-        "type": "string",
-        "default": "level"
-      }
-    }
-  },
-  "link_only_music": {
-    "description": "仅链接解析（不支持搜索）：QQ音乐、汽水、酷我等",
-    "type": "object",
-    "items": {
-      "qq_endpoint": {
-        "description": "QQ 音乐解析地址",
-        "type": "string",
-        "default": "https://api.bugpk.com/api/qqmusic"
-      },
-      "qq_url_param": {
-        "type": "string",
-        "default": "url"
-      },
-      "qq_lyric_path": {
-        "description": "QQ：歌词（相对 data），空字符串表示不取",
-        "type": "string",
-        "default": "lrc_data"
-      },
-      "qishui_endpoint": {
-        "description": "汽水音乐解析地址",
-        "type": "string",
-        "default": "https://api.bugpk.com/api/qsmusic"
-      },
-      "qishui_url_param": {
-        "type": "string",
-        "default": "url"
-      },
-      "qishui_title_path": {
-        "description": "汽水：曲名/展示标题（相对 data）",
-        "type": "string",
-        "default": "albumname"
-      },
-      "qishui_author_path": {
-        "type": "string",
-        "default": "artistsname"
-      },
-      "qishui_audio_path": {
-        "description": "汽水：音频/媒体直链",
-        "type": "string",
-        "default": "url"
-      },
-      "kuwo_endpoint": {
-        "description": "酷我解析地址",
-        "type": "string",
-        "default": "https://api.bugpk.com/api/kuwo"
-      },
-      "kuwo_url_param": {
-        "type": "string",
-        "default": "url"
-      },
-      "generic_path_code": {
-        "description": "通用：code 路径",
-        "type": "string",
-        "default": "code"
-      },
-      "generic_success_codes": {
-        "type": "string",
-        "default": "200"
-      },
-      "generic_path_msg": {
-        "type": "string",
-        "default": "msg"
-      },
-      "generic_data_root": {
-        "type": "string",
-        "default": "data"
-      },
-      "generic_title": {
-        "type": "string",
-        "default": "name"
-      },
-      "generic_author": {
-        "type": "string",
-        "default": "author"
-      },
-      "generic_cover": {
-        "type": "string",
-        "default": "cover"
-      },
-      "generic_audio_url": {
-        "description": "音频地址（QQ: url；酷我: music_url）",
-        "type": "string",
-        "default": "url"
-      },
-      "kuwo_audio_path": {
-        "description": "酷我专用音频路径（相对 data），优先级高于 generic_audio_url",
-        "type": "string",
-        "default": "music_url"
-      },
-      "kuwo_title_path": {
-        "type": "string",
-        "default": "title"
-      },
-      "kuwo_author_path": {
-        "type": "string",
-        "default": "artist"
-      },
-      "kuwo_cover_path": {
-        "type": "string",
-        "default": "pic"
-      },
-      "qishui_cover_path": {
-        "description": "汽水：封面（可为数组字段下标，如 artistsmedium_avatar_url.0）",
-        "type": "string",
-        "default": "artistsmedium_avatar_url.0"
-      },
-      "qishui_lyric_path": {
-        "type": "string",
-        "default": "lyric"
-      },
-      "kuwo_lyric_path": {
-        "type": "string",
-        "default": "lyrics_url"
-      }
-    }
-  },
-  "http": {
-    "description": "HTTP",
-    "type": "object",
-    "items": {
-      "timeout_sec": {
-        "type": "int",
-        "default": 45
-      },
-      "user_agent": {
-        "type": "string",
-        "default": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
-      }
-    }
-  },
-  "debug": {
-    "description": "调试开关（建议只在排错时临时开启）",
-    "type": "object",
-    "items": {
-      "enable": {
-        "description": "开启后在 AstrBot 日志中打印网易云搜索/解析返回的部分 JSON",
+      "auto_short_video": {
+        "description": "自动解析短视频链接",
         "type": "bool",
-        "default": false
+        "default": true,
+        "hint": "消息中出现抖音、快手、小红书、即梦、千问、视频号等支持域名时自动解析。"
       },
-      "max_chars": {
-        "description": "单次打印 JSON 文本的最大字符数（避免刷屏）",
+      "auto_douyin_profile": {
+        "description": "自动解析抖音主页",
+        "type": "bool",
+        "default": true,
+        "hint": "识别抖音用户主页链接并打包发送作品列表。"
+      },
+      "auto_music_link": {
+        "description": "自动解析音乐分享链接",
+        "type": "bool",
+        "default": true,
+        "hint": "支持网易云、QQ 音乐、汽水音乐、酷我等分享链接。"
+      },
+      "dedup_enable": {
+        "description": "启用链接去重",
+        "type": "bool",
+        "default": true,
+        "hint": "避免命令处理器、自动触发或短时间重复消息造成重复解析。"
+      },
+      "dedup_window_sec": {
+        "description": "去重时间窗口（秒）",
         "type": "int",
-        "default": 800
+        "default": 30,
+        "condition": {
+          "dedup_enable": true
+        },
+        "slider": {
+          "min": 5,
+          "max": 300,
+          "step": 5
+        },
+        "hint": "同一链接在此时间内只处理一次。"
       }
     }
   },
   "message": {
-    "description": "消息展示",
+    "description": "💬 消息输出与合并转发",
     "type": "object",
+    "hint": "设置解析提示、合并转发重试、媒体展示数量和音乐语音消息。",
     "items": {
       "opening_enable": {
-        "description": "解析前发送开场语",
+        "description": "显示“正在解析”提示",
         "type": "bool",
-        "default": true
+        "default": true,
+        "hint": "关闭后将直接等待解析结果，群聊消息更简洁。"
       },
       "opening_text": {
+        "description": "解析提示文字",
         "type": "string",
-        "default": "正在解析，请稍候…"
+        "default": "正在解析，请稍候…",
+        "condition": {
+          "opening_enable": true
+        },
+        "hint": "插件会自动添加“BkTools：”前缀。"
       },
       "pack_forward": {
-        "description": "短视频结果打包为消息集合（Nodes），逻辑参考 astrbot_plugin_media_parser",
+        "description": "使用合并转发发送解析结果",
         "type": "bool",
-        "default": true
+        "default": true,
+        "hint": "推荐开启。打包失败会自动重试；全部失败后仅发送接口原始 JSON，不会逐作品刷屏。",
+        "obvious_hint": true
+      },
+      "advanced_settings": {
+        "description": "显示高级消息设置",
+        "type": "bool",
+        "default": false,
+        "hint": "展开重试间隔、封面、原链接、展示数量和语音限制等细节设置。"
+      },
+      "pack_retry_count": {
+        "description": "合并转发重试次数",
+        "type": "int",
+        "default": 2,
+        "condition": {
+          "pack_forward": true,
+          "advanced_settings": true
+        },
+        "slider": {
+          "min": 0,
+          "max": 5,
+          "step": 1
+        },
+        "hint": "默认重试 2 次，即首次发送加 2 次重试，最多尝试 3 次。"
+      },
+      "pack_retry_delay_ms": {
+        "description": "重试间隔（毫秒）",
+        "type": "int",
+        "default": 800,
+        "condition": {
+          "pack_forward": true,
+          "advanced_settings": true
+        },
+        "slider": {
+          "min": 0,
+          "max": 5000,
+          "step": 100
+        },
+        "hint": "建议保持 500-1500 毫秒，过短可能连续触发平台限流。"
       },
       "short_video_text_metadata": {
-        "description": "短视频：是否发送标题/作者/文案等文字节点（关闭则仅发媒体）",
+        "description": "显示作品标题、作者和文案",
         "type": "bool",
-        "default": true
+        "default": true,
+        "hint": "关闭后仅发送视频、图片或资源链接。"
       },
       "pack_send_video": {
-        "description": "短视频：使用 Video 组件发视频（依赖 AstrBot Video.fromURL；失败则回退为纯文本直链）",
+        "description": "使用 Video 组件发送视频",
         "type": "bool",
-        "default": true
+        "default": true,
+        "hint": "关闭后视频以文本直链发送；开启时依赖当前平台对 Video.fromURL 的支持。"
       },
       "pack_include_cover": {
-        "description": "短视频：有视频时是否在视频前附带封面图节点",
+        "description": "视频结果附带封面",
         "type": "bool",
-        "default": true
+        "default": true,
+        "condition": {
+          "advanced_settings": true
+        },
+        "hint": "有视频资源时，在视频节点前加入作品封面。"
       },
       "pack_append_original_link": {
-        "description": "短视频：文字末尾附加原始分享链接",
+        "description": "附带原始分享链接",
         "type": "bool",
-        "default": true
+        "default": true,
+        "condition": {
+          "advanced_settings": true
+        },
+        "hint": "在作品文字信息末尾保留用户发送的原始链接，便于回溯。"
       },
       "max_images_per_work": {
-        "description": "每条作品最多发送图集张数（防刷屏）",
+        "description": "每个作品最多展示图片数",
         "type": "int",
-        "default": 9
+        "default": 9,
+        "condition": {
+          "advanced_settings": true
+        },
+        "slider": {
+          "min": 1,
+          "max": 30,
+          "step": 1
+        },
+        "hint": "仅限制消息展示数量，不会修改接口返回的完整 JSON。"
       },
       "search_result_limit": {
-        "description": "网易云搜索最多展示条数",
+        "description": "作品列表/搜歌最大展示数",
         "type": "int",
-        "default": 8
+        "default": 8,
+        "condition": {
+          "advanced_settings": true
+        },
+        "slider": {
+          "min": 1,
+          "max": 20,
+          "step": 1
+        },
+        "hint": "同时用于抖音主页作品列表和网易云搜索结果。"
       },
       "send_voice_message": {
-        "description": "音乐解析：是否发送语音消息（需要安装 pydub 和 ffmpeg）",
+        "description": "音乐解析后发送语音消息",
         "type": "bool",
-        "default": true
+        "default": true,
+        "hint": "需要服务器已安装 pydub 与 ffmpeg；失败时仍会保留音乐直链。"
       },
       "voice_max_duration": {
-        "description": "语音消息最大时长（秒），超过将自动截断",
+        "description": "语音最大时长（秒）",
         "type": "int",
-        "default": 60
+        "default": 60,
+        "condition": {
+          "send_voice_message": true,
+          "advanced_settings": true
+        },
+        "slider": {
+          "min": 10,
+          "max": 300,
+          "step": 10
+        },
+        "hint": "超过此时长时会自动截断。"
       },
       "voice_max_size_mb": {
-        "description": "音频文件最大大小（MB），超过将不发送语音消息",
+        "description": "音频下载大小上限（MB）",
         "type": "int",
-        "default": 10
+        "default": 10,
+        "condition": {
+          "send_voice_message": true,
+          "advanced_settings": true
+        },
+        "slider": {
+          "min": 1,
+          "max": 100,
+          "step": 1
+        },
+        "hint": "超过限制时不下载转换，避免占用过多内存和带宽。"
       }
     }
   },
-  "cache": {
-    "description": "缓存管理",
+  "short_video": {
+    "description": "🎬 短视频解析接口",
     "type": "object",
+    "hint": "普通使用只需确认接口地址；字段路径仅在接口返回结构不同或自行部署接口时调整。",
     "items": {
-      "temp_prefix": {
-        "description": "临时文件前缀（清理缓存时识别用）",
+      "endpoint": {
+        "description": "短视频解析接口地址",
         "type": "string",
-        "default": "bktools_audio_",
-        "invisible": true
-      }
-    }
-  },
-  "alist": {
-    "description": "Alist 文件上传（用于视频分片上传加速）",
-    "type": "object",
-    "items": {
-      "enable": {
-        "description": "启用 Alist 上传功能",
-        "type": "bool",
-        "default": false
+        "default": "https://api.bugpk.com/api/short_videos",
+        "hint": "填写完整接口地址，不要在末尾手动拼接 ?url= 参数。",
+        "obvious_hint": true
       },
-      "upload_only": {
-        "description": "仅上传直链（不发送视频文件）",
-        "type": "bool",
-        "default": false
-      },
-      "url": {
-        "description": "Alist 地址（如 https://alist.example.com）",
+      "request_method": {
+        "description": "接口请求方式",
         "type": "string",
-        "default": ""
+        "options": [
+          "GET",
+          "POST"
+        ],
+        "labels": [
+          "GET 查询参数",
+          "POST 表单"
+        ],
+        "default": "GET"
       },
-      "username": {
-        "description": "Alist 用户名",
+      "advanced_settings": {
+        "description": "显示高级字段映射",
+        "type": "bool",
+        "default": false,
+        "hint": "仅当自定义接口的参数名或 JSON 结构与默认值不一致时开启。"
+      },
+      "url_param_name": {
+        "description": "作品链接参数名",
         "type": "string",
-        "default": ""
+        "default": "url",
+        "condition": {
+          "advanced_settings": true
+        },
+        "hint": "接口接收作品分享链接时使用的参数名。"
       },
-      "password": {
-        "description": "Alist 密码",
+      "path_code": {
+        "description": "业务状态码路径",
         "type": "string",
-        "default": ""
+        "default": "code",
+        "condition": {
+          "advanced_settings": true
+        }
       },
-      "upload_path": {
-        "description": "上传目录路径（如 /视频分享）",
+      "success_codes": {
+        "description": "成功状态码",
         "type": "string",
-        "default": "/"
+        "default": "200",
+        "condition": {
+          "advanced_settings": true
+        },
+        "hint": "多个状态码使用英文逗号分隔，例如 200,0。"
       },
-      "chunk_size_mb": {
-        "description": "分片大小（MB），建议 5-50",
-        "type": "int",
-        "default": 10
+      "path_msg": {
+        "description": "提示信息路径",
+        "type": "string",
+        "default": "msg",
+        "condition": {
+          "advanced_settings": true
+        }
       },
-      "request_timeout": {
-        "description": "请求超时时间（秒）",
-        "type": "int",
-        "default": 60
-      }
-    }
-  },
-  "trigger": {
-    "description": "触发",
-    "type": "object",
-    "items": {
-      "auto_short_video": {
-        "description": "消息中出现短视频域名时自动解析",
-        "type": "bool",
-        "default": true
+      "path_data_root": {
+        "description": "作品数据根路径",
+        "type": "string",
+        "default": "data",
+        "condition": {
+          "advanced_settings": true
+        },
+        "hint": "标题、作者、封面等字段默认从此对象内读取。"
       },
-      "auto_music_link": {
-        "description": "消息中出现音乐平台分享链接时自动链解析（仅链接，无搜索）",
-        "type": "bool",
-        "default": true
+      "path_title": {
+        "description": "标题字段路径",
+        "type": "string",
+        "default": "title",
+        "condition": {
+          "advanced_settings": true
+        }
       },
-      "auto_douyin_profile": {
-        "description": "消息中出现抖音用户主页链接时自动解析",
-        "type": "bool",
-        "default": true
+      "path_desc": {
+        "description": "文案字段路径",
+        "type": "string",
+        "default": "desc",
+        "condition": {
+          "advanced_settings": true
+        }
       },
-      "dedup_enable": {
-        "description": "启用链接去重（同链接短时间内只解析一次）",
-        "type": "bool",
-        "default": true
+      "path_type": {
+        "description": "资源类型字段路径",
+        "type": "string",
+        "default": "type",
+        "condition": {
+          "advanced_settings": true
+        },
+        "hint": "期望值为 video、image 或 live。"
       },
-      "dedup_window_sec": {
-        "description": "去重时间窗口（秒），此时间内相同链接不会重复解析",
-        "type": "int",
-        "default": 30
+      "path_author_name": {
+        "description": "作者昵称字段路径",
+        "type": "string",
+        "default": "author.name",
+        "condition": {
+          "advanced_settings": true
+        }
+      },
+      "path_author_avatar": {
+        "description": "作者头像字段路径",
+        "type": "string",
+        "default": "author.avatar",
+        "condition": {
+          "advanced_settings": true
+        }
+      },
+      "path_cover": {
+        "description": "作品封面字段路径",
+        "type": "string",
+        "default": "cover",
+        "condition": {
+          "advanced_settings": true
+        }
+      },
+      "path_video_url": {
+        "description": "主视频直链字段路径",
+        "type": "string",
+        "default": "url",
+        "condition": {
+          "advanced_settings": true
+        }
+      },
+      "path_video_backup_list": {
+        "description": "备用视频列表字段路径",
+        "type": "string",
+        "default": "video_backup",
+        "condition": {
+          "advanced_settings": true
+        },
+        "hint": "主视频直链为空时，从备用列表选择可用地址。"
+      },
+      "path_images_list": {
+        "description": "图集列表字段路径",
+        "type": "string",
+        "default": "images",
+        "condition": {
+          "advanced_settings": true
+        }
+      },
+      "path_live_photo_list": {
+        "description": "实况列表字段路径",
+        "type": "string",
+        "default": "live_photo",
+        "condition": {
+          "advanced_settings": true
+        }
+      },
+      "path_live_photo_video": {
+        "description": "实况项内视频字段路径",
+        "type": "string",
+        "default": "video",
+        "condition": {
+          "advanced_settings": true
+        }
+      },
+      "path_music_title": {
+        "description": "背景音乐标题字段路径",
+        "type": "string",
+        "default": "music.title",
+        "condition": {
+          "advanced_settings": true
+        }
+      },
+      "path_music_author": {
+        "description": "背景音乐作者字段路径",
+        "type": "string",
+        "default": "music.author",
+        "condition": {
+          "advanced_settings": true
+        }
+      },
+      "path_music_url": {
+        "description": "背景音乐直链字段路径",
+        "type": "string",
+        "default": "music.url",
+        "condition": {
+          "advanced_settings": true
+        }
       }
     }
   },
   "video_threshold": {
-    "description": "视频文件大小阈值控制（超过阈值自动发送链接而非直接传输）",
+    "description": "📦 视频发送策略",
     "type": "object",
+    "hint": "控制大视频是直接作为视频发送，还是改为发送资源链接。",
     "items": {
       "force_link_enabled": {
-        "description": "全局强制链接发送总开关（优先级最高，启用时无论文件大小如何均直接发送链接）",
+        "description": "始终发送视频直链",
         "type": "bool",
-        "default": false
+        "default": false,
+        "hint": "优先级最高。开启后不检测文件大小，所有视频都以文本链接发送。"
       },
       "threshold_enabled": {
-        "description": "阈值触发链接发送功能开关（仅在全局总开关关闭时生效）",
+        "description": "超过大小阈值时发送直链",
         "type": "bool",
-        "default": true
+        "default": true,
+        "condition": {
+          "force_link_enabled": false
+        },
+        "hint": "关闭后不执行 HEAD 大小检测，直接尝试发送视频组件。"
       },
       "threshold_mb": {
-        "description": "文件大小阈值（MB），超过此大小的视频将发送链接而非直接传输",
+        "description": "视频大小阈值（MB）",
         "type": "int",
-        "default": 100
+        "default": 100,
+        "condition": {
+          "force_link_enabled": false,
+          "threshold_enabled": true
+        },
+        "slider": {
+          "min": 10,
+          "max": 500,
+          "step": 10
+        },
+        "hint": "文件大于此值时改发直链，减少上传失败和群聊发送超时。"
       }
     }
   },
   "batch_output": {
-    "description": "批量内容输出控制（图集/实况超过数量时直接输出JSON）",
+    "description": "🧾 大批量内容输出",
     "type": "object",
+    "hint": "当图集或实况数量过多时，可直接发送接口完整 JSON，避免生成过大的合并转发。",
     "items": {
       "direct_json_enabled": {
-        "description": "启用直接输出JSON功能（图集或实况数量超过阈值时生效）",
+        "description": "超出数量时直接发送 JSON",
+        "type": "bool",
+        "default": false,
+        "hint": "JSON 会作为一条消息发送，不会拆分为单个作品或图片。"
+      },
+      "image_count_threshold": {
+        "description": "图集数量阈值",
+        "type": "int",
+        "default": 20,
+        "condition": {
+          "direct_json_enabled": true
+        },
+        "slider": {
+          "min": 1,
+          "max": 100,
+          "step": 1
+        }
+      },
+      "live_photo_count_threshold": {
+        "description": "实况视频数量阈值",
+        "type": "int",
+        "default": 10,
+        "condition": {
+          "direct_json_enabled": true
+        },
+        "slider": {
+          "min": 1,
+          "max": 100,
+          "step": 1
+        }
+      }
+    }
+  },
+  "netease": {
+    "description": "🎵 网易云搜索与链接解析",
+    "type": "object",
+    "hint": "支持关键词搜歌和网易云分享链接解析；默认配置适配 BugPk 163_music 接口。",
+    "items": {
+      "search_endpoint": {
+        "description": "网易云搜索接口",
+        "type": "string",
+        "default": "https://api.bugpk.com/api/163_music",
+        "hint": "留空将关闭关键词搜歌功能。"
+      },
+      "link_parse_endpoint": {
+        "description": "网易云链接解析接口",
+        "type": "string",
+        "default": "https://api.bugpk.com/api/163_music",
+        "hint": "留空时自动复用搜索接口。"
+      },
+      "advanced_settings": {
+        "description": "显示高级请求与字段映射",
+        "type": "bool",
+        "default": false,
+        "hint": "仅在更换接口或返回字段结构不一致时开启。"
+      },
+      "search_method": {
+        "description": "搜索请求方式",
+        "type": "string",
+        "options": [
+          "GET",
+          "POST"
+        ],
+        "labels": [
+          "GET 查询参数",
+          "POST 表单"
+        ],
+        "default": "GET",
+        "condition": {
+          "advanced_settings": true
+        }
+      },
+      "search_keyword_param": {
+        "description": "搜索关键词参数名",
+        "type": "string",
+        "default": "keywords",
+        "condition": {
+          "advanced_settings": true
+        }
+      },
+      "search_extra_params_json": {
+        "description": "搜索附加参数（JSON）",
+        "type": "string",
+        "default": "{\"type\":\"search\",\"limit\":10,\"offset\":0}",
+        "condition": {
+          "advanced_settings": true
+        },
+        "editor_mode": true,
+        "editor_language": "json",
+        "editor_theme": "vs-light",
+        "hint": "关键词由插件自动填入，此处只填写固定参数。"
+      },
+      "search_path_code": {
+        "description": "搜索状态码路径",
+        "type": "string",
+        "default": "code",
+        "condition": {
+          "advanced_settings": true
+        }
+      },
+      "search_success_codes": {
+        "description": "搜索成功状态码",
+        "type": "string",
+        "default": "200",
+        "condition": {
+          "advanced_settings": true
+        }
+      },
+      "search_path_msg": {
+        "description": "搜索提示信息路径",
+        "type": "string",
+        "default": "msg",
+        "condition": {
+          "advanced_settings": true
+        }
+      },
+      "search_list_path": {
+        "description": "搜索结果列表路径",
+        "type": "string",
+        "default": "data.songs",
+        "condition": {
+          "advanced_settings": true
+        }
+      },
+      "search_item_name": {
+        "description": "歌曲名称字段路径",
+        "type": "string",
+        "default": "name",
+        "condition": {
+          "advanced_settings": true
+        }
+      },
+      "search_item_artist": {
+        "description": "歌手字段路径",
+        "type": "string",
+        "default": "artists",
+        "condition": {
+          "advanced_settings": true
+        }
+      },
+      "search_item_id": {
+        "description": "歌曲 ID 字段路径",
+        "type": "string",
+        "default": "id",
+        "condition": {
+          "advanced_settings": true
+        }
+      },
+      "search_item_album": {
+        "description": "专辑字段路径",
+        "type": "string",
+        "default": "album",
+        "condition": {
+          "advanced_settings": true
+        }
+      },
+      "link_url_param": {
+        "description": "分享链接参数名",
+        "type": "string",
+        "default": "url",
+        "condition": {
+          "advanced_settings": true
+        }
+      },
+      "link_method": {
+        "description": "链接解析请求方式",
+        "type": "string",
+        "options": [
+          "GET",
+          "POST"
+        ],
+        "labels": [
+          "GET 查询参数",
+          "POST 表单"
+        ],
+        "default": "GET",
+        "condition": {
+          "advanced_settings": true
+        }
+      },
+      "link_parse_extra_params_json": {
+        "description": "链接解析附加参数（JSON）",
+        "type": "string",
+        "default": "{\"type\":\"json\",\"level\":\"standard\"}",
+        "condition": {
+          "advanced_settings": true
+        },
+        "editor_mode": true,
+        "editor_language": "json",
+        "editor_theme": "vs-light"
+      },
+      "parse_path_code": {
+        "description": "解析状态码路径",
+        "type": "string",
+        "default": "code",
+        "condition": {
+          "advanced_settings": true
+        }
+      },
+      "parse_success_codes": {
+        "description": "解析成功状态码",
+        "type": "string",
+        "default": "200",
+        "condition": {
+          "advanced_settings": true
+        }
+      },
+      "parse_path_msg": {
+        "description": "解析提示信息路径",
+        "type": "string",
+        "default": "msg",
+        "condition": {
+          "advanced_settings": true
+        }
+      },
+      "parse_data_root": {
+        "description": "歌曲数据根路径",
+        "type": "string",
+        "default": "data",
+        "condition": {
+          "advanced_settings": true
+        }
+      },
+      "parse_title": {
+        "description": "歌曲名称字段路径",
+        "type": "string",
+        "default": "name",
+        "condition": {
+          "advanced_settings": true
+        }
+      },
+      "parse_author": {
+        "description": "歌手字段路径",
+        "type": "string",
+        "default": "ar_name",
+        "condition": {
+          "advanced_settings": true
+        }
+      },
+      "parse_cover": {
+        "description": "封面字段路径",
+        "type": "string",
+        "default": "pic",
+        "condition": {
+          "advanced_settings": true
+        }
+      },
+      "parse_audio_url": {
+        "description": "音频直链字段路径",
+        "type": "string",
+        "default": "url",
+        "condition": {
+          "advanced_settings": true
+        }
+      },
+      "parse_lyric": {
+        "description": "歌词字段路径",
+        "type": "string",
+        "default": "lyric",
+        "condition": {
+          "advanced_settings": true
+        }
+      },
+      "parse_album": {
+        "description": "专辑字段路径",
+        "type": "string",
+        "default": "al_name",
+        "condition": {
+          "advanced_settings": true
+        }
+      },
+      "parse_size": {
+        "description": "文件大小字段路径",
+        "type": "string",
+        "default": "size",
+        "condition": {
+          "advanced_settings": true
+        }
+      },
+      "parse_quality": {
+        "description": "音质字段路径",
+        "type": "string",
+        "default": "level",
+        "condition": {
+          "advanced_settings": true
+        }
+      }
+    }
+  },
+  "link_only_music": {
+    "description": "🎧 QQ / 汽水 / 酷我音乐",
+    "type": "object",
+    "hint": "这些平台仅支持分享链接解析，不支持关键词搜索。",
+    "items": {
+      "qq_endpoint": {
+        "description": "QQ 音乐解析接口",
+        "type": "string",
+        "default": "https://api.bugpk.com/api/qqmusic"
+      },
+      "qishui_endpoint": {
+        "description": "汽水音乐解析接口",
+        "type": "string",
+        "default": "https://api.bugpk.com/api/qsmusic"
+      },
+      "kuwo_endpoint": {
+        "description": "酷我音乐解析接口",
+        "type": "string",
+        "default": "https://api.bugpk.com/api/kuwo"
+      },
+      "advanced_settings": {
+        "description": "显示高级字段映射",
+        "type": "bool",
+        "default": false,
+        "hint": "默认接口无需修改；自定义接口时再开启。"
+      },
+      "qq_url_param": {
+        "description": "QQ 音乐链接参数名",
+        "type": "string",
+        "default": "url",
+        "condition": {
+          "advanced_settings": true
+        }
+      },
+      "qq_lyric_path": {
+        "description": "QQ 音乐歌词字段路径",
+        "type": "string",
+        "default": "lrc_data",
+        "condition": {
+          "advanced_settings": true
+        }
+      },
+      "qishui_url_param": {
+        "description": "汽水音乐链接参数名",
+        "type": "string",
+        "default": "url",
+        "condition": {
+          "advanced_settings": true
+        }
+      },
+      "qishui_title_path": {
+        "description": "汽水音乐标题字段路径",
+        "type": "string",
+        "default": "albumname",
+        "condition": {
+          "advanced_settings": true
+        }
+      },
+      "qishui_author_path": {
+        "description": "汽水音乐歌手字段路径",
+        "type": "string",
+        "default": "artistsname",
+        "condition": {
+          "advanced_settings": true
+        }
+      },
+      "qishui_audio_path": {
+        "description": "汽水音乐音频字段路径",
+        "type": "string",
+        "default": "url",
+        "condition": {
+          "advanced_settings": true
+        }
+      },
+      "qishui_cover_path": {
+        "description": "汽水音乐封面字段路径",
+        "type": "string",
+        "default": "artistsmedium_avatar_url.0",
+        "condition": {
+          "advanced_settings": true
+        }
+      },
+      "qishui_lyric_path": {
+        "description": "汽水音乐歌词字段路径",
+        "type": "string",
+        "default": "lyric",
+        "condition": {
+          "advanced_settings": true
+        }
+      },
+      "kuwo_url_param": {
+        "description": "酷我音乐链接参数名",
+        "type": "string",
+        "default": "url",
+        "condition": {
+          "advanced_settings": true
+        }
+      },
+      "kuwo_audio_path": {
+        "description": "酷我音乐音频字段路径",
+        "type": "string",
+        "default": "music_url",
+        "condition": {
+          "advanced_settings": true
+        }
+      },
+      "kuwo_title_path": {
+        "description": "酷我音乐标题字段路径",
+        "type": "string",
+        "default": "title",
+        "condition": {
+          "advanced_settings": true
+        }
+      },
+      "kuwo_author_path": {
+        "description": "酷我音乐歌手字段路径",
+        "type": "string",
+        "default": "artist",
+        "condition": {
+          "advanced_settings": true
+        }
+      },
+      "kuwo_cover_path": {
+        "description": "酷我音乐封面字段路径",
+        "type": "string",
+        "default": "pic",
+        "condition": {
+          "advanced_settings": true
+        }
+      },
+      "kuwo_lyric_path": {
+        "description": "酷我音乐歌词字段路径",
+        "type": "string",
+        "default": "lyrics_url",
+        "condition": {
+          "advanced_settings": true
+        }
+      },
+      "generic_path_code": {
+        "description": "通用状态码路径",
+        "type": "string",
+        "default": "code",
+        "condition": {
+          "advanced_settings": true
+        }
+      },
+      "generic_success_codes": {
+        "description": "通用成功状态码",
+        "type": "string",
+        "default": "200",
+        "condition": {
+          "advanced_settings": true
+        }
+      },
+      "generic_path_msg": {
+        "description": "通用提示信息路径",
+        "type": "string",
+        "default": "msg",
+        "condition": {
+          "advanced_settings": true
+        }
+      },
+      "generic_data_root": {
+        "description": "通用数据根路径",
+        "type": "string",
+        "default": "data",
+        "condition": {
+          "advanced_settings": true
+        }
+      },
+      "generic_title": {
+        "description": "通用歌曲标题字段路径",
+        "type": "string",
+        "default": "name",
+        "condition": {
+          "advanced_settings": true
+        }
+      },
+      "generic_author": {
+        "description": "通用歌手字段路径",
+        "type": "string",
+        "default": "author",
+        "condition": {
+          "advanced_settings": true
+        }
+      },
+      "generic_cover": {
+        "description": "通用封面字段路径",
+        "type": "string",
+        "default": "cover",
+        "condition": {
+          "advanced_settings": true
+        }
+      },
+      "generic_audio_url": {
+        "description": "通用音频字段路径",
+        "type": "string",
+        "default": "url",
+        "condition": {
+          "advanced_settings": true
+        },
+        "hint": "QQ 音乐通常为 url；酷我优先使用专用 music_url 字段。"
+      }
+    }
+  },
+  "alist": {
+    "description": "☁️ Alist 视频上传（可选）",
+    "type": "object",
+    "hint": "将视频先上传到自己的 Alist，再发送可访问直链。未使用 Alist 时保持关闭即可。",
+    "items": {
+      "enable": {
+        "description": "启用 Alist 上传",
         "type": "bool",
         "default": false
       },
-      "image_count_threshold": {
-        "description": "图集数量阈值（超过此数量时直接输出JSON）",
-        "type": "int",
-        "default": 20
+      "url": {
+        "description": "Alist 服务地址",
+        "type": "string",
+        "default": "",
+        "condition": {
+          "enable": true
+        },
+        "hint": "例如 https://alist.example.com，不要填写后台管理路径。",
+        "obvious_hint": true
       },
-      "live_photo_count_threshold": {
-        "description": "实况（多段视频）数量阈值（超过此数量时直接输出JSON）",
+      "username": {
+        "description": "Alist 用户名",
+        "type": "string",
+        "default": "",
+        "condition": {
+          "enable": true
+        }
+      },
+      "password": {
+        "description": "Alist 密码",
+        "type": "string",
+        "default": "",
+        "condition": {
+          "enable": true
+        },
+        "hint": "请使用权限受限的专用账号。"
+      },
+      "upload_path": {
+        "description": "上传目录",
+        "type": "string",
+        "default": "/",
+        "condition": {
+          "enable": true
+        },
+        "hint": "例如 /视频分享。目标目录需已存在并允许写入。"
+      },
+      "upload_only": {
+        "description": "仅发送 Alist 直链",
+        "type": "bool",
+        "default": false,
+        "condition": {
+          "enable": true
+        },
+        "hint": "开启后不再额外发送原视频组件，可减少重复流量。"
+      },
+      "chunk_size_mb": {
+        "description": "上传分片大小（MB）",
         "type": "int",
-        "default": 10
+        "default": 10,
+        "condition": {
+          "enable": true
+        },
+        "slider": {
+          "min": 1,
+          "max": 100,
+          "step": 1
+        },
+        "hint": "一般建议 5-50 MB。"
+      },
+      "request_timeout": {
+        "description": "上传超时时间（秒）",
+        "type": "int",
+        "default": 60,
+        "condition": {
+          "enable": true
+        },
+        "slider": {
+          "min": 10,
+          "max": 300,
+          "step": 10
+        }
+      }
+    }
+  },
+  "http": {
+    "description": "🌐 网络请求",
+    "type": "object",
+    "hint": "统一控制解析接口请求超时和 User-Agent。",
+    "items": {
+      "timeout_sec": {
+        "description": "接口请求超时（秒）",
+        "type": "int",
+        "default": 45,
+        "slider": {
+          "min": 5,
+          "max": 180,
+          "step": 5
+        },
+        "hint": "网络较慢或接口需要处理大资源时可适当增加。"
+      },
+      "advanced_settings": {
+        "description": "显示高级网络设置",
+        "type": "bool",
+        "default": false
+      },
+      "user_agent": {
+        "description": "HTTP User-Agent",
+        "type": "string",
+        "default": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
+        "condition": {
+          "advanced_settings": true
+        },
+        "hint": "除非目标接口有特殊要求，否则建议保持默认值。"
+      }
+    }
+  },
+  "debug": {
+    "description": "🛠️ 调试与诊断",
+    "type": "object",
+    "hint": "仅在排查接口字段或音乐解析问题时临时开启。",
+    "items": {
+      "enable": {
+        "description": "输出调试日志",
+        "type": "bool",
+        "default": false,
+        "hint": "会在 AstrBot 日志中打印部分接口 JSON，请勿长期开启。",
+        "obvious_hint": true
+      },
+      "max_chars": {
+        "description": "单次日志最大字符数",
+        "type": "int",
+        "default": 800,
+        "condition": {
+          "enable": true
+        },
+        "slider": {
+          "min": 100,
+          "max": 5000,
+          "step": 100
+        },
+        "hint": "限制日志长度，避免完整响应刷屏或泄露过多数据。"
       }
     }
   }

@@ -1,2 +1,4 @@
 manual_upload/
 astrbot_plugin_bktools.zip
+__pycache__/
+*.pyc

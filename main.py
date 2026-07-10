@@ -5,12 +5,17 @@ AstrBot 插件：BugPk 工具集（短视频解析、网易云搜歌、多平台
 
 from __future__ import annotations
 
+import asyncio
+import copy
 import hashlib
 import json
 import os
 import re
 import tempfile
 import time
+from contextlib import contextmanager
+from contextvars import ContextVar
+from functools import wraps
 from typing import Any, Dict, List, Optional, Tuple
 from urllib.parse import quote, quote_plus, urlencode
 
@@ -32,6 +37,50 @@ def _cfg(root: Any, *keys: str, default: Any = None) -> Any:
             return default
         cur = cur[k]
     return cur
+
+
+def _deep_merge_dict(base: Dict[str, Any], override: Dict[str, Any]) -> Dict[str, Any]:
+    """递归合并配置，不修改全局配置或群覆盖原对象。"""
+    result: Dict[str, Any] = copy.deepcopy(base)
+    for key, value in override.items():
+        if isinstance(value, dict) and isinstance(result.get(key), dict):
+            result[key] = _deep_merge_dict(result[key], value)
+        else:
+            result[key] = copy.deepcopy(value)
+    return result
+
+
+def _apply_tri_state(target: Dict[str, Any], path: Tuple[str, str], state: Any) -> None:
+    """把 inherit/enable/disable 三态设置写入目标配置。"""
+    normalized = str(state or "inherit").strip().lower()
+    if normalized not in {"enable", "disable"}:
+        return
+    section, key = path
+    section_cfg = target.setdefault(section, {})
+    if isinstance(section_cfg, dict):
+        section_cfg[key] = normalized == "enable"
+
+
+def _event_scoped(feature: Optional[str] = None, *, silent: bool = False):
+    """为命令和自动事件应用当前群的启用策略与有效配置。"""
+
+    def decorator(func):
+        @wraps(func)
+        async def wrapped(self, event: AstrMessageEvent, *args, **kwargs):
+            with self._event_runtime(event) as policy:
+                if policy is None:
+                    if not silent:
+                        await self._send_disabled_notice(event)
+                    return None
+                if feature and not self._feature_enabled(feature):
+                    if not silent:
+                        await self._send_feature_disabled_notice(event, feature)
+                    return None
+                return await func(self, event, *args, **kwargs)
+
+        return wrapped
+
+    return decorator
 
 
 def _parse_success_codes(s: str) -> set:
@@ -164,7 +213,12 @@ def _chain_to_forward_nodes(
     for n in chain:
         if n is None:
             continue
-        flat.append(Node(name=sender_name, uin=sender_id, content=[n]))
+        # 主页作品列表本身已经构造了 Node；再次包一层会形成 Node -> Node
+        # 的非法嵌套，部分平台会因此拒绝合并转发。
+        if isinstance(n, Node):
+            flat.append(n)
+        else:
+            flat.append(Node(name=sender_name, uin=sender_id, content=[n]))
     return flat
 
 
@@ -476,7 +530,7 @@ def _is_douyin_profile_url(url: str) -> bool:
     "astrbot_plugin_bktools",
     "jiuhunwl",
     "BugPk 工具：短视频解析、网易云搜歌、QQ/汽水/酷我链解析",
-    "1.2.6"
+    "1.2.9"
 )
 class BKToolsPlugin(Star):
     def __init__(self, context: Context, config: Optional[Dict[str, Any]] = None):
@@ -484,32 +538,341 @@ class BKToolsPlugin(Star):
         self.config: Dict[str, Any] = config if isinstance(config, dict) else {}
         self._netease_pick_cache: Dict[str, Dict[str, Any]] = {}
         self._dedup_cache: Dict[str, float] = {}
-        self._alist: Optional[AlistUploader] = None
-        self._stop_parsing_flag: bool = False
+        self._alist_uploaders: Dict[str, AlistUploader] = {}
+        self._runtime_config_var: ContextVar[Optional[Dict[str, Any]]] = ContextVar(
+            "bktools_runtime_config", default=None
+        )
+        self._runtime_scope_var: ContextVar[str] = ContextVar(
+            "bktools_runtime_scope", default="global"
+        )
+        self._runtime_features_var: ContextVar[Optional[Dict[str, bool]]] = ContextVar(
+            "bktools_runtime_features", default=None
+        )
+        # 停止代次按群/私聊会话隔离，避免 A 群的停止命令中断 B 群任务。
+        self._parse_cancel_generation: Dict[str, int] = {}
         self._parsing_lock: Dict[str, bool] = {}  # 解析锁，防止同一链接重复解析
 
+    def _runtime_config(self) -> Dict[str, Any]:
+        return self._runtime_config_var.get() or self.config
+
+    def _runtime_scope(self) -> str:
+        return self._runtime_scope_var.get()
+
+    @staticmethod
+    def _event_platform(event: AstrMessageEvent) -> str:
+        try:
+            return str(event.get_platform_name() or "unknown").strip().lower()
+        except Exception:
+            return "unknown"
+
+    @staticmethod
+    def _event_group_id(event: AstrMessageEvent) -> str:
+        try:
+            getter = getattr(event, "get_group_id", None)
+            if callable(getter):
+                value = getter()
+                if value:
+                    return str(value).strip()
+        except Exception:
+            pass
+        for attr in ("group_id", "room_id", "channel_id"):
+            value = getattr(event, attr, None)
+            if value:
+                return str(value).strip()
+        message_obj = getattr(event, "message_obj", None)
+        value = getattr(message_obj, "group_id", None) if message_obj else None
+        return str(value).strip() if value else ""
+
+    @staticmethod
+    def _event_sender_id(event: AstrMessageEvent) -> str:
+        try:
+            getter = getattr(event, "get_sender_id", None)
+            if callable(getter):
+                value = getter()
+                if value:
+                    return str(value).strip()
+        except Exception:
+            pass
+        for attr in ("user_id", "sender_id"):
+            value = getattr(event, attr, None)
+            if value:
+                return str(value).strip()
+        return "unknown"
+
+    def _scope_for_event(self, event: AstrMessageEvent) -> str:
+        platform = self._event_platform(event)
+        group_id = self._event_group_id(event)
+        if group_id:
+            return f"{platform}:group:{group_id}"
+        return f"{platform}:private:{self._event_sender_id(event)}"
+
+    def _find_group_override(
+        self, group_id: str, platform: str, overrides: Any
+    ) -> Optional[Dict[str, Any]]:
+        if not isinstance(overrides, list):
+            return None
+        wildcard: Optional[Dict[str, Any]] = None
+        for item in overrides:
+            if not isinstance(item, dict):
+                continue
+            if str(item.get("group_id") or "").strip() != group_id:
+                continue
+            configured_platform = str(item.get("platform") or "").strip().lower()
+            if configured_platform == platform:
+                return item
+            if not configured_platform and wildcard is None:
+                wildcard = item
+        return wildcard
+
+    def _resolve_event_policy(self, event: AstrMessageEvent) -> Dict[str, Any]:
+        group_cfg = _cfg(self.config, "group_control", default={}) or {}
+        platform = self._event_platform(event)
+        group_id = self._event_group_id(event)
+        scope = self._scope_for_event(event)
+        features = {
+            "short_video": True,
+            "douyin_profile": True,
+            "netease": True,
+            "music": True,
+        }
+
+        if not group_id:
+            return {
+                "enabled": bool(group_cfg.get("private_chat_enabled", True)),
+                "config": copy.deepcopy(self.config),
+                "features": features,
+                "scope": scope,
+            }
+
+        override = self._find_group_override(
+            group_id, platform, group_cfg.get("group_overrides", [])
+        )
+        mode = str(group_cfg.get("mode") or "all").strip().lower()
+        if mode == "selected":
+            enabled = bool(override and override.get("enabled", True))
+        else:
+            enabled = bool(override.get("enabled", True)) if override else True
+
+        effective = copy.deepcopy(self.config)
+        if override:
+            feature_cfg = override.get("features", {}) or {}
+            if isinstance(feature_cfg, dict):
+                for key in features:
+                    if key in feature_cfg:
+                        features[key] = bool(feature_cfg.get(key))
+
+            raw_override = override.get("override_json", "{}")
+            parsed_override: Dict[str, Any] = {}
+            if isinstance(raw_override, dict):
+                parsed_override = raw_override
+            elif isinstance(raw_override, str) and raw_override.strip():
+                try:
+                    loaded = json.loads(raw_override)
+                    if isinstance(loaded, dict):
+                        parsed_override = loaded
+                    else:
+                        logger.warning("群 %s 的高级覆盖必须是 JSON 对象", group_id)
+                except json.JSONDecodeError as ex:
+                    logger.warning("群 %s 的高级覆盖 JSON 无效: %s", group_id, ex)
+            # 群覆盖不能反向修改群控制规则本身。
+            parsed_override = dict(parsed_override)
+            parsed_override.pop("group_control", None)
+            if parsed_override:
+                effective = _deep_merge_dict(effective, parsed_override)
+
+            behavior = override.get("behavior", {}) or {}
+            if isinstance(behavior, dict):
+                mappings = {
+                    "auto_short_video": ("trigger", "auto_short_video"),
+                    "auto_douyin_profile": ("trigger", "auto_douyin_profile"),
+                    "auto_music_link": ("trigger", "auto_music_link"),
+                    "pack_forward": ("message", "pack_forward"),
+                    "opening_enable": ("message", "opening_enable"),
+                    "send_voice_message": ("message", "send_voice_message"),
+                    "force_link_enabled": ("video_threshold", "force_link_enabled"),
+                    "direct_json_enabled": ("batch_output", "direct_json_enabled"),
+                }
+                for key, path in mappings.items():
+                    _apply_tri_state(effective, path, behavior.get(key))
+
+        return {
+            "enabled": enabled,
+            "config": effective,
+            "features": features,
+            "scope": scope,
+        }
+
+    @contextmanager
+    def _event_runtime(self, event: AstrMessageEvent):
+        policy = self._resolve_event_policy(event)
+        if not policy.get("enabled"):
+            yield None
+            return
+        config_token = self._runtime_config_var.set(policy["config"])
+        scope_token = self._runtime_scope_var.set(str(policy["scope"]))
+        feature_token = self._runtime_features_var.set(policy["features"])
+        try:
+            yield policy
+        finally:
+            self._runtime_features_var.reset(feature_token)
+            self._runtime_scope_var.reset(scope_token)
+            self._runtime_config_var.reset(config_token)
+
+    def _feature_enabled(self, feature: str) -> bool:
+        features = self._runtime_features_var.get() or {}
+        return bool(features.get(feature, True))
+
+    async def _send_disabled_notice(self, event: AstrMessageEvent) -> None:
+        group_cfg = _cfg(self.config, "group_control", default={}) or {}
+        text = str(
+            group_cfg.get("disabled_message")
+            or "当前群未启用 BKtools，请联系管理员调整插件群聊设置。"
+        ).strip()
+        if text:
+            await event.send(event.plain_result(text))
+
+    async def _send_feature_disabled_notice(
+        self, event: AstrMessageEvent, feature: str
+    ) -> None:
+        names = {
+            "short_video": "短视频解析",
+            "douyin_profile": "抖音主页解析",
+            "netease": "网易云搜歌",
+            "music": "音乐链接解析",
+        }
+        display_name = names.get(feature, feature)
+        await event.send(
+            event.plain_result(f"当前群已关闭{display_name}功能。")
+        )
+
     def _get_alist(self) -> Optional[AlistUploader]:
-        if self._alist is None:
-            self._alist = AlistUploader(self.config)
-        return self._alist if self._alist.is_enabled else None
+        config = self._runtime_config()
+        alist_cfg = _cfg(config, "alist", default={}) or {}
+        if not bool(alist_cfg.get("enable", False)):
+            return None
+        cache_key = json.dumps(alist_cfg, ensure_ascii=False, sort_keys=True, default=str)
+        uploader = self._alist_uploaders.get(cache_key)
+        if uploader is None:
+            uploader = AlistUploader(config)
+            self._alist_uploaders[cache_key] = uploader
+        return uploader if uploader.is_enabled else None
 
     def _check_dedup(self, url: str) -> bool:
         """检查链接是否在去重窗口期内返回 True 表示需要跳过（已解析过）"""
-        tr = _cfg(self.config, "trigger", default={}) or {}
+        tr = _cfg(self._runtime_config(), "trigger", default={}) or {}
         if not tr.get("dedup_enable", True):
             return False
-        import time
         window = tr.get("dedup_window_sec", 30)
         now = time.time()
-        last_time = self._dedup_cache.get(url)
+        cache_key = f"{self._runtime_scope()}:{url}"
+        last_time = self._dedup_cache.get(cache_key)
         if last_time and (now - last_time) < window:
             return True
-        self._dedup_cache[url] = now
+        self._dedup_cache[cache_key] = now
         return False
 
     def _debug_cfg(self) -> Tuple[bool, int]:
-        d = _cfg(self.config, "debug", default={}) or {}
+        d = _cfg(self._runtime_config(), "debug", default={}) or {}
         return bool(d.get("enable", False)), int(d.get("max_chars", 800) or 800)
+
+    def _new_parse_token(self) -> Tuple[str, int]:
+        scope = self._runtime_scope()
+        return scope, self._parse_cancel_generation.get(scope, 0)
+
+    def _is_parse_cancelled(self, token: Tuple[str, int]) -> bool:
+        scope, generation = token
+        return generation != self._parse_cancel_generation.get(scope, 0)
+
+    def _cancel_active_parses(self) -> None:
+        scope = self._runtime_scope()
+        self._parse_cancel_generation[scope] = (
+            self._parse_cancel_generation.get(scope, 0) + 1
+        )
+
+    def _pack_retry_cfg(self) -> Tuple[int, float]:
+        msg_cfg = _cfg(self._runtime_config(), "message", default={}) or {}
+        try:
+            retry_count = int(msg_cfg.get("pack_retry_count", 2) or 0)
+        except (TypeError, ValueError):
+            retry_count = 2
+        try:
+            delay_ms = int(msg_cfg.get("pack_retry_delay_ms", 800) or 0)
+        except (TypeError, ValueError):
+            delay_ms = 800
+        # 限制重试范围，避免错误配置导致长时间阻塞或刷屏。
+        return max(0, min(retry_count, 5)), max(0, min(delay_ms, 5000)) / 1000
+
+    async def _send_json_result(
+        self,
+        event: AstrMessageEvent,
+        payload: Dict[str, Any],
+        parse_token: Tuple[str, int],
+        reason: str,
+    ) -> bool:
+        """以单条纯文本发送解析接口原始 JSON，不拆分为作品消息。"""
+        if self._is_parse_cancelled(parse_token):
+            logger.info("%s前收到停止解析指令，取消发送 JSON", reason)
+            return False
+        try:
+            # 使用紧凑 JSON，降低群消息长度限制导致发送失败的概率。
+            json_text = json.dumps(
+                payload,
+                ensure_ascii=False,
+                separators=(",", ":"),
+                default=str,
+            )
+            await event.send(event.plain_result(json_text))
+            return True
+        except Exception as ex:
+            logger.error("%s，发送解析 JSON 失败: %s", reason, ex)
+            return False
+
+    async def _send_packed_or_json(
+        self,
+        event: AstrMessageEvent,
+        forward_nodes: List[Node],
+        raw_json: Dict[str, Any],
+        parse_token: Tuple[str, int],
+        label: str,
+    ) -> bool:
+        """合并转发失败时重试；全部失败后只发送原始 JSON。"""
+        if not forward_nodes:
+            logger.warning("%s没有可用的合并转发节点，直接发送解析 JSON", label)
+            return await self._send_json_result(
+                event, raw_json, parse_token, f"{label}无法构造合并转发"
+            )
+
+        retry_count, retry_delay = self._pack_retry_cfg()
+        total_attempts = retry_count + 1
+        last_error: Optional[Exception] = None
+
+        for attempt in range(1, total_attempts + 1):
+            if self._is_parse_cancelled(parse_token):
+                logger.info("%s发送前收到停止解析指令", label)
+                return False
+            try:
+                await event.send(event.chain_result([Nodes(forward_nodes)]))
+                return True
+            except Exception as ex:
+                last_error = ex
+                logger.warning(
+                    "%s合并转发失败（第 %d/%d 次）: %s",
+                    label,
+                    attempt,
+                    total_attempts,
+                    ex,
+                )
+                if attempt < total_attempts and retry_delay > 0:
+                    await asyncio.sleep(retry_delay)
+
+        logger.warning(
+            "%s合并转发重试全部失败，改为发送解析 JSON；最后错误: %s",
+            label,
+            last_error,
+        )
+        return await self._send_json_result(
+            event, raw_json, parse_token, f"{label}合并转发失败"
+        )
 
     def _event_scope_key(self, event: AstrMessageEvent) -> str:
         """为“搜歌后选序号”生成会话级 key，尽量按会话隔离。"""
@@ -574,7 +937,7 @@ class BKToolsPlugin(Star):
         return True
 
     def _http_cfg(self) -> Tuple[int, str]:
-        h = _cfg(self.config, "http", default={}) or {}
+        h = _cfg(self._runtime_config(), "http", default={}) or {}
         return int(h.get("timeout_sec", 45)), str(
             h.get(
                 "user_agent",
@@ -594,7 +957,7 @@ class BKToolsPlugin(Star):
         return name, sid
 
     async def _maybe_opening(self, event: AstrMessageEvent) -> None:
-        msg = _cfg(self.config, "message", default={}) or {}
+        msg = _cfg(self._runtime_config(), "message", default={}) or {}
         if not msg.get("opening_enable"):
             return
         text = (msg.get("opening_text") or "").strip()
@@ -659,7 +1022,7 @@ class BKToolsPlugin(Star):
         return u
 
     async def _fetch_short_video(self, link: str) -> Tuple[Dict[str, Any], Dict[str, Any]]:
-        cfg_sv = _cfg(self.config, "short_video", default={}) or {}
+        cfg_sv = _cfg(self._runtime_config(), "short_video", default={}) or {}
         endpoint = (cfg_sv.get("endpoint") or "").strip().rstrip("?&")
         if not endpoint:
             raise ValueError("未配置短视频 endpoint")
@@ -723,25 +1086,28 @@ class BKToolsPlugin(Star):
         return "\n".join(lines) if lines else "（无文本信息）"
 
     async def _reply_short_video(self, event: AstrMessageEvent, link: str) -> None:
-        # 重置停止标志
-        self._stop_parsing_flag = False
-        
+        parse_token = self._new_parse_token()
         await self._maybe_opening(event)
+        if self._is_parse_cancelled(parse_token):
+            logger.info("短视频解析在请求接口前被停止: %s", link)
+            return
+
         try:
             j, data = await self._fetch_short_video(link)
         except Exception as e:
+            if self._is_parse_cancelled(parse_token):
+                logger.info("短视频解析已停止，不再发送失败消息: %s", link)
+                return
             logger.warning("短视频解析失败: %s，链接: %s", e, link)
             await event.send(event.plain_result(f"短视频解析失败：{e}"))
             return
-        
-        # 检查停止标志
-        if self._stop_parsing_flag:
-            logger.info("解析已被强制停止")
-            await event.send(event.plain_result("解析已被强制停止"))
+
+        if self._is_parse_cancelled(parse_token):
+            logger.info("短视频解析在接口返回后被停止: %s", link)
             return
-        
-        cfg_sv = _cfg(self.config, "short_video", default={}) or {}
-        msg_cfg = _cfg(self.config, "message", default={}) or {}
+
+        cfg_sv = _cfg(self._runtime_config(), "short_video", default={}) or {}
+        msg_cfg = _cfg(self._runtime_config(), "message", default={}) or {}
 
         vurl = _first_video_url(data, cfg_sv, j)
         live_vs = _live_photo_videos(data, cfg_sv, j)
@@ -763,7 +1129,7 @@ class BKToolsPlugin(Star):
                     img_list.append(str(x).strip())
 
         # 批量输出控制：检查图集/实况数量是否超过阈值
-        batch_cfg = _cfg(self.config, "batch_output", default={}) or {}
+        batch_cfg = _cfg(self._runtime_config(), "batch_output", default={}) or {}
         direct_json_enabled = bool(batch_cfg.get("direct_json_enabled", False))
         img_threshold = int(batch_cfg.get("image_count_threshold", 20))
         live_threshold = int(batch_cfg.get("live_photo_count_threshold", 10))
@@ -775,12 +1141,10 @@ class BKToolsPlugin(Star):
                     "批量输出: 图集数量(%d)超过阈值(%d)或实况数量(%d)超过阈值(%d)，直接输出JSON",
                     img_total_count, img_threshold, live_count, live_threshold
                 )
-                try:
-                    json_str = json.dumps(j, ensure_ascii=False, indent=2)
-                    await event.send(event.plain_result(json_str))
-                    return
-                except Exception as e:
-                    logger.warning("输出JSON失败: %s", str(e))
+                await self._send_json_result(
+                    event, j, parse_token, "批量内容超过阈值"
+                )
+                return
 
         cover = _rel_data(data, cfg_sv.get("path_cover") or "cover", j)
         cover_s = str(cover).strip() if cover else ""
@@ -792,20 +1156,24 @@ class BKToolsPlugin(Star):
         text_meta = bool(msg_cfg.get("short_video_text_metadata", True))
 
         # 视频文件大小阈值控制
-        vth = _cfg(self.config, "video_threshold", default={}) or {}
+        vth = _cfg(self._runtime_config(), "video_threshold", default={}) or {}
         force_link = bool(vth.get("force_link_enabled", False))
         threshold_on = bool(vth.get("threshold_enabled", True))
         threshold_mb = int(vth.get("threshold_mb", 100) or 100)
 
-        include_video_line = True
-        if video_urls and pack_send_video:
-            include_video_line = False
+        # 视频资源会在后续作为 Video 节点或独立直链节点加入消息，元信息中
+        # 不再重复展示同一个地址。
+        include_video_line = not bool(video_urls)
         text = self._format_short_video_text(
             cfg_sv,
             data,
             j,
             include_video_line=include_video_line,
         )
+        if bool(msg_cfg.get("pack_append_original_link", True)) and link:
+            original_line = f"原始链接：{link.strip()}"
+            if link.strip() and link.strip() not in text:
+                text = f"{text.rstrip()}\n{original_line}"
 
         chain: List[Any] = []
         if text_meta and text.strip():
@@ -814,28 +1182,24 @@ class BKToolsPlugin(Star):
             chain.append(Plain("解析完成"))
 
         if video_urls:
-            # 检查停止标志
-            if self._stop_parsing_flag:
-                logger.info("解析已被强制停止")
-                await event.send(event.plain_result("解析已被强制停止"))
+            if self._is_parse_cancelled(parse_token):
+                logger.info("短视频解析在构造视频节点前被停止: %s", link)
                 return
-                
+
             if pack_include_cover and cover_s:
                 ci = _make_image_node(cover_s)
                 if ci:
                     chain.append(ci)
             alist = self._get_alist()
-            upload_only = alist.is_enabled and _cfg(self.config, "alist", "upload_only", default=False) if alist else False
+            upload_only = alist.is_enabled and _cfg(self._runtime_config(), "alist", "upload_only", default=False) if alist else False
             for vu in video_urls:
-                # 检查停止标志
-                if self._stop_parsing_flag:
-                    logger.info("解析已被强制停止")
-                    await event.send(event.plain_result("解析已被强制停止"))
+                if self._is_parse_cancelled(parse_token):
+                    logger.info("短视频解析在处理视频资源时被停止: %s", link)
                     return
-                    
+
+                vu_str = str(vu).strip()
                 if pack_send_video:
                     # 阈值检查：决定是否应发送链接而非直接传输视频文件
-                    vu_str = str(vu).strip()
                     send_as_link = False
                     if force_link:
                         # 全局强制链接发送开关开启，直接发送链接
@@ -845,6 +1209,9 @@ class BKToolsPlugin(Star):
                         # 阈值开关开启，检测文件大小
                         try:
                             file_size = await _get_url_content_length(vu_str)
+                            if self._is_parse_cancelled(parse_token):
+                                logger.info("短视频解析在检测文件大小后被停止: %s", link)
+                                return
                             if file_size is not None:
                                 size_mb = file_size / (1024 * 1024)
                                 if size_mb > threshold_mb:
@@ -866,10 +1233,17 @@ class BKToolsPlugin(Star):
                     if send_as_link:
                         chain.append(Plain(f"视频：{vu_str}"))
                     elif alist:
+                        temp_video: Optional[str] = None
                         try:
                             temp_video = await _download_video(vu_str)
+                            if self._is_parse_cancelled(parse_token):
+                                logger.info("短视频解析在下载视频后被停止: %s", link)
+                                return
                             if temp_video:
                                 alist_url = await alist.upload_file(temp_video, share_url=vu_str)
+                                if self._is_parse_cancelled(parse_token):
+                                    logger.info("短视频解析在上传视频后被停止: %s", link)
+                                    return
                                 if alist_url:
                                     chain.append(Plain(alist_url))
                                     if not upload_only:
@@ -878,15 +1252,17 @@ class BKToolsPlugin(Star):
                                             chain.append(vn)
                                 else:
                                     chain.append(Plain(f"视频：{vu_str}"))
-                                try:
-                                    os.unlink(temp_video)
-                                except Exception:
-                                    pass
                             else:
                                 chain.append(Plain(f"视频：{vu_str}"))
                         except Exception as e:
                             logger.warning("Alist 上传失败: %s", str(e))
                             chain.append(Plain(f"视频：{str(vu).strip()}"))
+                        finally:
+                            if temp_video:
+                                try:
+                                    os.unlink(temp_video)
+                                except Exception:
+                                    pass
                     else:
                         vn = _make_video_node(vu_str)
                         chain.append(vn if vn is not None else Plain(f"视频：{vu_str}"))
@@ -894,12 +1270,10 @@ class BKToolsPlugin(Star):
                     chain.append(Plain(f"视频：{vu_str}"))
         else:
             for u in img_list:
-                # 检查停止标志
-                if self._stop_parsing_flag:
-                    logger.info("解析已被强制停止")
-                    await event.send(event.plain_result("解析已被强制停止"))
+                if self._is_parse_cancelled(parse_token):
+                    logger.info("短视频解析在处理图片资源时被停止: %s", link)
                     return
-                    
+
                 im = _make_image_node(u)
                 if im:
                     chain.append(im)
@@ -917,27 +1291,28 @@ class BKToolsPlugin(Star):
         pack = bool(msg_cfg.get("pack_forward", True))
         name, uid = self._bot_identity(event)
 
+        if self._is_parse_cancelled(parse_token):
+            logger.info("短视频解析在发送结果前被停止: %s", link)
+            return
+
         if pack:
             flat = _chain_to_forward_nodes(chain, name, uid)
-            if flat:
-                try:
-                    await event.send(event.chain_result([Nodes(flat)]))
-                except Exception as ex:
-                    logger.warning("发送合并转发失败: %s，尝试逐条发送", ex)
-                    for comp in chain:
-                        try:
-                            await event.send(event.chain_result([comp]))
-                        except Exception as ex2:
-                            logger.warning("发送节点失败: %s", ex2)
-        else:
-            for comp in chain:
-                 try:
-                     await event.send(event.chain_result([comp]))
-                 except Exception as ex:
-                     logger.warning("发送节点失败: %s", ex)
+            await self._send_packed_or_json(
+                event, flat, j, parse_token, "短视频解析结果"
+            )
+            return
+
+        for comp in chain:
+            if self._is_parse_cancelled(parse_token):
+                logger.info("短视频非打包发送过程中收到停止指令: %s", link)
+                return
+            try:
+                await event.send(event.chain_result([comp]))
+            except Exception as ex:
+                logger.warning("发送节点失败: %s", ex)
 
     async def _fetch_douyin_profile(self, profile_url: str) -> Tuple[Dict[str, Any], List[Dict[str, Any]]]:
-        cfg_sv = _cfg(self.config, "short_video", default={}) or {}
+        cfg_sv = _cfg(self._runtime_config(), "short_video", default={}) or {}
         endpoint = (cfg_sv.get("endpoint") or "").strip().rstrip("?&")
         if not endpoint:
             raise ValueError("未配置短视频 endpoint")
@@ -1001,19 +1376,31 @@ class BKToolsPlugin(Star):
         return "\n".join(lines)
 
     async def _reply_douyin_profile(self, event: AstrMessageEvent, profile_url: str) -> None:
+        parse_token = self._new_parse_token()
         await self._maybe_opening(event)
+        if self._is_parse_cancelled(parse_token):
+            logger.info("抖音主页解析在请求接口前被停止: %s", profile_url)
+            return
+
         try:
             j, items = await self._fetch_douyin_profile(profile_url)
         except Exception as e:
+            if self._is_parse_cancelled(parse_token):
+                logger.info("抖音主页解析已停止，不再发送失败消息: %s", profile_url)
+                return
             logger.warning("抖音主页解析失败: %s，链接: %s", e, profile_url)
             await event.send(event.plain_result(f"抖音主页解析失败：{e}"))
+            return
+
+        if self._is_parse_cancelled(parse_token):
+            logger.info("抖音主页解析在接口返回后被停止: %s", profile_url)
             return
 
         if not items:
             await event.send(event.plain_result("未获取到作品数据"))
             return
 
-        msg_cfg = _cfg(self.config, "message", default={}) or {}
+        msg_cfg = _cfg(self._runtime_config(), "message", default={}) or {}
 
         pagination = j.get("pagination", {}) or {}
         total = pagination.get("total", len(items))
@@ -1064,17 +1451,22 @@ class BKToolsPlugin(Star):
         pack = bool(msg_cfg.get("pack_forward", True))
         if pack and nodes:
             flat = _chain_to_forward_nodes(nodes, name, uid)
-            if flat:
-                await event.send(event.chain_result([Nodes(flat)]))
-        else:
-            for node in nodes:
-                try:
-                    await event.send(event.chain_result([node]))
-                except Exception as ex:
-                    logger.warning("发送节点失败: %s", ex)
+            await self._send_packed_or_json(
+                event, flat, j, parse_token, "抖音主页作品列表"
+            )
+            return
+
+        for node in nodes:
+            if self._is_parse_cancelled(parse_token):
+                logger.info("抖音主页非打包发送过程中收到停止指令: %s", profile_url)
+                return
+            try:
+                await event.send(event.chain_result([node]))
+            except Exception as ex:
+                logger.warning("发送节点失败: %s", ex)
 
     async def _netease_search(self, event: AstrMessageEvent, keyword: str) -> None:
-        ne = _cfg(self.config, "netease", default={}) or {}
+        ne = _cfg(self._runtime_config(), "netease", default={}) or {}
         ep = (ne.get("search_endpoint") or "").strip()
         if not ep:
             await event.send(
@@ -1128,7 +1520,7 @@ class BKToolsPlugin(Star):
         if not isinstance(items, list):
             await event.send(event.plain_result("搜索无结果或列表路径配置不对。"))
             return
-        lim = int((_cfg(self.config, "message", default={}) or {}).get("search_result_limit", 8))
+        lim = int((_cfg(self._runtime_config(), "message", default={}) or {}).get("search_result_limit", 8))
         lines: List[str] = []
         candidates: List[Dict[str, Any]] = []
         for i, it in enumerate(items[:lim]):
@@ -1166,8 +1558,8 @@ class BKToolsPlugin(Star):
 
     async def _music_link_parse(self, event: AstrMessageEvent, link: str) -> None:
         plat = _music_platform(link)
-        ne = _cfg(self.config, "netease", default={}) or {}
-        lo = _cfg(self.config, "link_only_music", default={}) or {}
+        ne = _cfg(self._runtime_config(), "netease", default={}) or {}
+        lo = _cfg(self._runtime_config(), "link_only_music", default={}) or {}
         timeout_sec, ua = self._http_cfg()
         headers = {"User-Agent": ua}
         to = aiohttp.ClientTimeout(total=timeout_sec)
@@ -1386,7 +1778,7 @@ class BKToolsPlugin(Star):
                 preview += "…"
             lines.append("歌词预览：\n" + preview)
         text = "\n".join(x for x in lines if x)
-        msg_cfg = _cfg(self.config, "message", default={}) or {}
+        msg_cfg = _cfg(self._runtime_config(), "message", default={}) or {}
         
         # 尝试发送语音消息
         voice_sent = False
@@ -1436,6 +1828,7 @@ class BKToolsPlugin(Star):
         return ""
 
     @filter.command("bk帮助")
+    @_event_scoped()
     async def cmd_help(self, event: AstrMessageEvent):
         """BKtools 命令说明"""
         await event.send(
@@ -1454,6 +1847,7 @@ class BKToolsPlugin(Star):
         )
 
     @filter.command("bk视频")
+    @_event_scoped("short_video")
     async def cmd_video_slash(self, event: AstrMessageEvent):
         """短视频解析"""
         arg = self._cmd_arg(event, "bk视频")
@@ -1463,6 +1857,7 @@ class BKToolsPlugin(Star):
         await self._reply_short_video(event, arg)
 
     @filter.command("bktv")
+    @_event_scoped("short_video")
     async def cmd_video_alias(self, event: AstrMessageEvent):
         """短视频解析（简写）"""
         arg = self._cmd_arg(event, "bktv")
@@ -1472,6 +1867,7 @@ class BKToolsPlugin(Star):
         await self._reply_short_video(event, arg)
 
     @filter.command("bk主页")
+    @_event_scoped("douyin_profile")
     async def cmd_douyin_profile(self, event: AstrMessageEvent):
         """抖音主页作品列表解析"""
         arg = self._cmd_arg(event, "bk主页")
@@ -1481,6 +1877,7 @@ class BKToolsPlugin(Star):
         await self._reply_douyin_profile(event, arg)
 
     @filter.command("bk网易云")
+    @_event_scoped("netease")
     async def cmd_netease(self, event: AstrMessageEvent):
         """网易云音乐搜索（仅此平台支持关键词搜索）"""
         arg = self._cmd_arg(event, "bk网易云")
@@ -1490,6 +1887,7 @@ class BKToolsPlugin(Star):
         await self._netease_search(event, arg)
 
     @filter.command("bk搜歌")
+    @_event_scoped("netease")
     async def cmd_netease_alias(self, event: AstrMessageEvent):
         """同 bk网易云"""
         arg = self._cmd_arg(event, "bk搜歌")
@@ -1499,6 +1897,7 @@ class BKToolsPlugin(Star):
         await self._netease_search(event, arg)
 
     @filter.command("bk点歌")
+    @_event_scoped("netease")
     async def cmd_netease_pick(self, event: AstrMessageEvent):
         """按序号选择最近搜索结果"""
         arg = self._cmd_arg(event, "bk点歌")
@@ -1512,6 +1911,7 @@ class BKToolsPlugin(Star):
             )
 
     @filter.command("bk音乐")
+    @_event_scoped("music")
     async def cmd_music(self, event: AstrMessageEvent):
         """音乐链接解析（不支持关键词；非网易平台仅链接）"""
         arg = self._cmd_arg(event, "bk音乐")
@@ -1526,6 +1926,7 @@ class BKToolsPlugin(Star):
         await self._music_link_parse(event, arg)
 
     @filter.command("bk清理缓存")
+    @_event_scoped()
     async def cmd_cleanup_cache(self, event: AstrMessageEvent):
         """清理本插件的临时缓存文件"""
         try:
@@ -1547,21 +1948,46 @@ class BKToolsPlugin(Star):
             await event.send(event.plain_result(f"清理失败: {str(e)}"))
 
     @filter.command("bk停止解析")
+    @_event_scoped()
     async def cmd_stop_parsing(self, event: AstrMessageEvent):
-        """强制停止当前解析任务并截断输出"""
-        self._stop_parsing_flag = True
-        await event.send(event.plain_result("已强制停止解析"))
+        """强制停止当前解析任务、截断输出并清理缓存"""
+        # 递增取消代次，所有已经启动的短视频/主页解析都会在下一个检查点退出；
+        # 新启动的任务使用新代次，不会反向恢复旧任务。
+        self._cancel_active_parses()
+
+        # 清理缓存文件
+        try:
+            cache_dir = tempfile.gettempdir()
+            prefix = "bktools_audio_"
+            count = 0
+            size = 0
+            for f in os.listdir(cache_dir):
+                if f.startswith(prefix):
+                    path = os.path.join(cache_dir, f)
+                    try:
+                        size += os.path.getsize(path)
+                        os.unlink(path)
+                        count += 1
+                    except Exception:
+                        pass
+            if count > 0:
+                await event.send(event.plain_result(f"已强制停止解析，已清理 {count} 个缓存文件，释放 {size / 1024 / 1024:.2f} MB"))
+            else:
+                await event.send(event.plain_result("已强制停止解析"))
+        except Exception as e:
+            await event.send(event.plain_result(f"已强制停止解析，但清理缓存失败: {str(e)}"))
 
     @filter.event_message_type(EventMessageType.ALL)
+    @_event_scoped(silent=True)
     async def on_auto(self, event: AstrMessageEvent):
         """自动触发短视频 / 音乐链"""
         user_id = getattr(event, 'user_id', None)
         if user_id == 0:
             return
-        tr = _cfg(self.config, "trigger", default={}) or {}
+        tr = _cfg(self._runtime_config(), "trigger", default={}) or {}
         text = event.message_str or ""
         pure = text.strip()
-        if pure.isdigit():
+        if pure.isdigit() and self._feature_enabled("netease"):
             picked = await self._netease_pick_by_index(event, int(pure))
             if picked:
                 return
