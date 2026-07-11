@@ -6,26 +6,71 @@ AstrBot 插件：BugPk 工具集（短视频解析、网易云搜歌、多平台
 from __future__ import annotations
 
 import asyncio
-import copy
 import hashlib
+import ipaddress
 import json
 import os
 import re
+import shutil
+import socket
 import tempfile
 import time
-from contextlib import contextmanager
+from contextlib import asynccontextmanager, contextmanager
 from contextvars import ContextVar
 from functools import wraps
+from collections.abc import Mapping
 from typing import Any, Dict, List, Optional, Tuple
-from urllib.parse import quote, quote_plus, urlencode
+from urllib.parse import quote, quote_plus, urlencode, urljoin, urlparse
 
 import aiohttp
 
 from astrbot.api import logger
 from astrbot.api.event import filter, AstrMessageEvent
 from astrbot.api.message_components import Image, Node, Nodes, Plain, Record, Video
+try:
+    from astrbot.api.message_components import File
+except ImportError:  # AstrBot 旧版本没有 File 组件时保留文本回退
+    File = None
 from astrbot.api.star import Context, Star, register
 from astrbot.core.star.filter.event_message_type import EventMessageType
+
+try:
+    from .bktools_runtime import (
+        CircuitOpenError,
+        RuntimeManager,
+        SafeHttpClient,
+        TaskState,
+        create_json_temp,
+    )
+except ImportError:
+    from bktools_runtime import (
+        CircuitOpenError,
+        RuntimeManager,
+        SafeHttpClient,
+        TaskState,
+        create_json_temp,
+    )
+try:
+    from .bktools_updater import (
+        GITHUB_API,
+        REPOSITORY,
+        UpdateInfo,
+        compare_versions,
+        install_archive,
+        metadata_version,
+    )
+except ImportError:
+    from bktools_updater import (
+        GITHUB_API,
+        REPOSITORY,
+        UpdateInfo,
+        compare_versions,
+        install_archive,
+        metadata_version,
+    )
+
+
+PLUGIN_VERSION = "1.6.0"
 
 
 def _cfg(root: Any, *keys: str, default: Any = None) -> Any:
@@ -39,14 +84,30 @@ def _cfg(root: Any, *keys: str, default: Any = None) -> Any:
     return cur
 
 
+def _plain_config_value(value: Any) -> Any:
+    """把 AstrBotConfig/dict 子类转换为普通容器，避免 deepcopy 协议冲突。"""
+    if isinstance(value, Mapping):
+        return {
+            str(key): _plain_config_value(item)
+            for key, item in value.items()
+        }
+    if isinstance(value, list):
+        return [_plain_config_value(item) for item in value]
+    if isinstance(value, tuple):
+        return tuple(_plain_config_value(item) for item in value)
+    if isinstance(value, set):
+        return {_plain_config_value(item) for item in value}
+    return value
+
+
 def _deep_merge_dict(base: Dict[str, Any], override: Dict[str, Any]) -> Dict[str, Any]:
-    """递归合并配置，不修改全局配置或群覆盖原对象。"""
-    result: Dict[str, Any] = copy.deepcopy(base)
+    """递归合并为普通配置容器，不触发框架对象的 deepcopy 魔术方法。"""
+    result: Dict[str, Any] = _plain_config_value(base)
     for key, value in override.items():
         if isinstance(value, dict) and isinstance(result.get(key), dict):
             result[key] = _deep_merge_dict(result[key], value)
         else:
-            result[key] = copy.deepcopy(value)
+            result[key] = _plain_config_value(value)
     return result
 
 
@@ -81,6 +142,44 @@ def _event_scoped(feature: Optional[str] = None, *, silent: bool = False):
         return wrapped
 
     return decorator
+
+
+def _tracked_parse(func):
+    """登记解析任务并应用当前会话并发限制，供停止命令真正取消。"""
+
+    @wraps(func)
+    async def wrapped(self, *args, **kwargs):
+        task = None
+        try:
+            async with self._track_parse_task():
+                task = asyncio.current_task()
+                self._runtime_manager.set_state(TaskState.PARSING)
+                return await func(self, *args, **kwargs)
+        except asyncio.CancelledError:
+            self._runtime_manager.finish_task(task, TaskState.CANCELLED)
+            logger.info("解析任务已取消: scope=%s, handler=%s", self._runtime_scope(), func.__name__)
+            return None
+        except Exception as ex:
+            self._runtime_manager.finish_task(task, TaskState.FAILED)
+            self._runtime_manager.set_state(TaskState.FAILED, str(ex))
+            raise
+        finally:
+            self._runtime_manager.cleanup_scope(self._runtime_scope())
+
+    return wrapped
+
+
+def _management_only(func):
+    """限制清理、停止和诊断等管理命令的调用权限。"""
+
+    @wraps(func)
+    async def wrapped(self, event: AstrMessageEvent, *args, **kwargs):
+        if not await self._is_management_allowed(event):
+            await event.send(event.plain_result("权限不足：该命令仅限授权管理员使用。"))
+            return None
+        return await func(self, event, *args, **kwargs)
+
+    return wrapped
 
 
 def _parse_success_codes(s: str) -> set:
@@ -202,6 +301,33 @@ def _make_video_node(url: str) -> Optional[Video]:
         return None
 
 
+def _make_file_node(path: str, name: str):
+    if File is None:
+        return None
+    for method_name in ("fromFileSystem", "from_file", "fromPath"):
+        method = getattr(File, method_name, None)
+        if callable(method):
+            try:
+                return method(path, name=name)
+            except TypeError:
+                try:
+                    return method(path)
+                except Exception:
+                    pass
+            except Exception:
+                pass
+    for kwargs in (
+        {"file": path, "name": name},
+        {"path": path, "name": name},
+        {"file_path": path, "name": name},
+    ):
+        try:
+            return File(**kwargs)
+        except Exception:
+            continue
+    return None
+
+
 def _chain_to_forward_nodes(
     chain: List[Any],
     sender_name: str,
@@ -311,11 +437,80 @@ class AlistUploader:
         return None
 
 
+def _ip_is_public(value: str) -> bool:
+    try:
+        return ipaddress.ip_address(value).is_global
+    except ValueError:
+        return False
+
+
+async def _validate_public_http_url(url: str) -> str:
+    """拒绝非 HTTP(S)、凭据 URL、非常用端口及解析到内网的地址。"""
+    value = str(url or "").strip()
+    parsed = urlparse(value)
+    if parsed.scheme.lower() not in {"http", "https"}:
+        raise ValueError("仅允许 http/https URL")
+    if not parsed.hostname:
+        raise ValueError("URL 缺少主机名")
+    if parsed.username or parsed.password:
+        raise ValueError("URL 不允许包含用户名或密码")
+    try:
+        port = parsed.port
+    except ValueError as ex:
+        raise ValueError("URL 端口无效") from ex
+    if port not in (None, 80, 443):
+        raise ValueError(f"不允许访问端口 {port}")
+
+    host = parsed.hostname.rstrip(".").lower()
+    if host == "localhost" or host.endswith(".localhost"):
+        raise ValueError("不允许访问本机地址")
+    if _ip_is_public(host):
+        return value
+    try:
+        ipaddress.ip_address(host)
+    except ValueError:
+        pass
+    else:
+        raise ValueError("不允许访问非公网 IP")
+
+    loop = asyncio.get_running_loop()
+    try:
+        infos = await loop.run_in_executor(
+            None, lambda: socket.getaddrinfo(host, port or 443, type=socket.SOCK_STREAM)
+        )
+    except socket.gaierror as ex:
+        raise ValueError("域名解析失败") from ex
+    addresses = {str(info[4][0]).split("%", 1)[0] for info in infos if info[4]}
+    if not addresses or any(not _ip_is_public(address) for address in addresses):
+        raise ValueError("域名解析到非公网地址")
+    return value
+
+
+def _public_url_trace_config() -> aiohttp.TraceConfig:
+    trace = aiohttp.TraceConfig()
+
+    async def _check_redirect(session, trace_config_ctx, params):
+        location = params.response.headers.get("Location")
+        if location:
+            await _validate_public_http_url(urljoin(str(params.url), location))
+
+    trace.on_request_redirect.append(_check_redirect)
+    return trace
+
+
 async def _download_video(url: str, timeout_sec: int = 300, max_size_mb: int = 500) -> Optional[str]:
     """下载视频文件到临时目录，返回文件路径"""
     try:
-        async with aiohttp.ClientSession(timeout=aiohttp.ClientTimeout(total=timeout_sec)) as session:
-            async with session.get(url, headers={"User-Agent": "Mozilla/5.0"}) as resp:
+        safe_url = await _validate_public_http_url(url)
+        async with aiohttp.ClientSession(
+            timeout=aiohttp.ClientTimeout(total=timeout_sec),
+            trace_configs=[_public_url_trace_config()],
+        ) as session:
+            async with session.get(
+                safe_url,
+                headers={"User-Agent": "Mozilla/5.0"},
+                max_redirects=5,
+            ) as resp:
                 if resp.status != 200:
                     logger.warning("下载视频失败: HTTP %d", resp.status)
                     return None
@@ -336,6 +531,12 @@ async def _download_video(url: str, timeout_sec: int = 300, max_size_mb: int = 5
                             f.write(chunk)
                     logger.info("视频下载成功: %s (%.2f MB)", temp_path, downloaded / 1024 / 1024)
                     return temp_path
+                except asyncio.CancelledError:
+                    try:
+                        os.unlink(temp_path)
+                    except OSError:
+                        pass
+                    raise
                 except Exception as e:
                     logger.warning("写入视频临时文件失败: %s", str(e))
                     try:
@@ -351,11 +552,15 @@ async def _download_video(url: str, timeout_sec: int = 300, max_size_mb: int = 5
 async def _get_url_content_length(url: str, timeout_sec: int = 15) -> Optional[int]:
     """通过 HEAD 请求获取远程文件大小（字节），失败返回 None"""
     try:
+        safe_url = await _validate_public_http_url(url)
         async with aiohttp.ClientSession(
             timeout=aiohttp.ClientTimeout(total=timeout_sec),
             headers={"User-Agent": "Mozilla/5.0"},
+            trace_configs=[_public_url_trace_config()],
         ) as session:
-            async with session.head(url, allow_redirects=True) as resp:
+            async with session.head(
+                safe_url, allow_redirects=True, max_redirects=5
+            ) as resp:
                 if resp.status in (200, 206):
                     cl = resp.headers.get("Content-Length")
                     if cl and cl.isdigit():
@@ -375,8 +580,12 @@ def _extract_urls(text: str) -> List[str]:
 async def _download_audio(url: str, timeout_sec: int = 60, max_size_mb: int = 10) -> Optional[str]:
     """下载音频文件到临时目录，返回文件路径"""
     try:
-        async with aiohttp.ClientSession(timeout=aiohttp.ClientTimeout(total=timeout_sec)) as session:
-            async with session.get(url) as resp:
+        safe_url = await _validate_public_http_url(url)
+        async with aiohttp.ClientSession(
+            timeout=aiohttp.ClientTimeout(total=timeout_sec),
+            trace_configs=[_public_url_trace_config()],
+        ) as session:
+            async with session.get(safe_url, max_redirects=5) as resp:
                 if resp.status != 200:
                     logger.warning("下载音频失败: HTTP %d", resp.status)
                     return None
@@ -403,6 +612,12 @@ async def _download_audio(url: str, timeout_sec: int = 60, max_size_mb: int = 10
                             f.write(chunk)
                     logger.info("音频下载成功: %s (%.2f MB)", temp_path, downloaded / 1024 / 1024)
                     return temp_path
+                except asyncio.CancelledError:
+                    try:
+                        os.unlink(temp_path)
+                    except OSError:
+                        pass
+                    raise
                 except Exception as e:
                     logger.warning("写入临时文件失败: %s, 路径: %s", str(e), temp_path)
                     try:
@@ -413,6 +628,24 @@ async def _download_audio(url: str, timeout_sec: int = 60, max_size_mb: int = 10
     except Exception as e:
         logger.warning("下载音频失败: %s", str(e))
         return None
+
+
+def _cleanup_temp_files() -> Tuple[int, int]:
+    cache_dir = tempfile.gettempdir()
+    prefixes = ("bktools_audio_", "bktools_video_", "bktools_voice_")
+    count = 0
+    size = 0
+    for name in os.listdir(cache_dir):
+        if not name.startswith(prefixes):
+            continue
+        path = os.path.join(cache_dir, name)
+        try:
+            size += os.path.getsize(path)
+            os.unlink(path)
+            count += 1
+        except OSError:
+            pass
+    return count, size
 
 
 def _convert_to_wav(input_path: str, max_duration_sec: int = 60) -> Optional[str]:
@@ -448,9 +681,24 @@ def _convert_to_wav(input_path: str, max_duration_sec: int = 60) -> Optional[str
         return None
 
 
+def _url_host(url: str) -> str:
+    try:
+        return (urlparse(str(url or "")).hostname or "").rstrip(".").lower()
+    except ValueError:
+        return ""
+
+
+def _host_matches(host: str, domain: str) -> bool:
+    normalized = str(domain or "").rstrip(".").lower()
+    return bool(host and normalized and (host == normalized or host.endswith(f".{normalized}")))
+
+
 def _is_qishui_url(url: str) -> bool:
-    u = (url or "").lower()
-    return "qishui.douyin.com" in u or "music.douyin.com" in u or "qishui.com" in u
+    host = _url_host(url)
+    return any(
+        _host_matches(host, domain)
+        for domain in ("qishui.douyin.com", "music.douyin.com", "qishui.com")
+    )
 
 
 # 视频自动解析域名集合（O(1) 查询）
@@ -464,44 +712,54 @@ _VIDEO_DOMAINS = frozenset((
 
 def _is_doubao_video_url(url: str) -> bool:
     """检测是否为豆包视频链接"""
-    u = (url or "").lower()
-    return "doubao.com" in u and "/video-sharing" in u
+    parsed = urlparse(str(url or ""))
+    return _host_matches((parsed.hostname or "").lower(), "doubao.com") and "/video-sharing" in parsed.path.lower()
 
 
 def _is_doubao_image_url(url: str) -> bool:
     """检测是否为豆包对话图片链接"""
-    u = (url or "").lower()
-    return "doubao.com" in u and "/thread/" in u
+    parsed = urlparse(str(url or ""))
+    return _host_matches((parsed.hostname or "").lower(), "doubao.com") and "/thread/" in parsed.path.lower()
 
 
 def _is_wechat_video_url(url: str) -> bool:
     """检测是否为微信视频号链接"""
-    u = (url or "").lower()
-    return "weixin.qq.com" in u and "/sph/" in u
+    parsed = urlparse(str(url or ""))
+    return _host_matches((parsed.hostname or "").lower(), "weixin.qq.com") and "/sph/" in parsed.path.lower()
 
 
 def _video_auto_match(url: str) -> bool:
-    u = (url or "").lower()
-    if _is_qishui_url(u):
+    if _is_qishui_url(url):
         return False
-    if "doubao.com" in u and ("/video-sharing" in u or "/thread/" in u):
+    if _is_doubao_video_url(url) or _is_doubao_image_url(url):
         return True
-    if "weixin.qq.com" in u and "/sph/" in u:
+    if _is_wechat_video_url(url):
         return True
-    return any(d in u for d in _VIDEO_DOMAINS)
+    host = _url_host(url)
+    return any(_host_matches(host, domain) for domain in _VIDEO_DOMAINS)
 
 
 def _music_platform(url: str) -> Optional[str]:
-    u = (url or "").lower()
-    if "music.163.com" in u or "163cn.tv" in u:
+    host = _url_host(url)
+    if _host_matches(host, "music.163.com") or _host_matches(host, "163cn.tv"):
         return "netease"
-    if "y.qq.com" in u or "qq.com/n/ryqq" in u:
+    if _host_matches(host, "y.qq.com") or (
+        _host_matches(host, "qq.com") and "/n/ryqq" in urlparse(str(url or "")).path.lower()
+    ):
         return "qq"
-    if _is_qishui_url(u):
+    if _is_qishui_url(url):
         return "qishui"
-    if "kuwo.cn" in u:
+    if _host_matches(host, "kuwo.cn"):
         return "kuwo"
     return None
+
+
+def _supported_share_url(url: str) -> bool:
+    return bool(
+        _video_auto_match(url)
+        or _music_platform(url)
+        or _is_douyin_profile_url(url)
+    )
 
 
 def _extract_netease_song_id(text: str) -> str:
@@ -517,25 +775,28 @@ def _extract_netease_song_id(text: str) -> str:
 
 def _is_douyin_profile_url(url: str) -> bool:
     """检测是否为抖音用户主页链接"""
-    u = (url or "").lower()
-    if u.startswith("v.douyin.com"):
-        path_lower = u.lower()
+    parsed = urlparse(str(url or ""))
+    host = (parsed.hostname or "").lower()
+    path_lower = parsed.path.lower()
+    if _host_matches(host, "v.douyin.com"):
         if "/show/" in path_lower or "/video/" in path_lower or "/item/" in path_lower:
             return False
         return True
-    return "/user/" in u or "douyin.com/user" in u
+    return _host_matches(host, "douyin.com") and "/user/" in path_lower
 
 
 @register(
     "astrbot_plugin_bktools",
     "jiuhunwl",
-    "BugPk 工具：短视频解析、网易云搜歌、QQ/汽水/酷我链解析",
-    "1.2.9"
+    "BugPk 工具：支持群级配置的短视频解析、网易云搜歌与多平台音乐解析",
+    PLUGIN_VERSION
 )
 class BKToolsPlugin(Star):
     def __init__(self, context: Context, config: Optional[Dict[str, Any]] = None):
         super().__init__(context)
-        self.config: Dict[str, Any] = config if isinstance(config, dict) else {}
+        self.config: Dict[str, Any] = (
+            _plain_config_value(config) if isinstance(config, Mapping) else {}
+        )
         self._netease_pick_cache: Dict[str, Dict[str, Any]] = {}
         self._dedup_cache: Dict[str, float] = {}
         self._alist_uploaders: Dict[str, AlistUploader] = {}
@@ -548,6 +809,15 @@ class BKToolsPlugin(Star):
         self._runtime_features_var: ContextVar[Optional[Dict[str, bool]]] = ContextVar(
             "bktools_runtime_features", default=None
         )
+        self._active_parse_tasks: Dict[str, set[asyncio.Task]] = {}
+        self._scope_semaphores: Dict[Tuple[str, int], asyncio.Semaphore] = {}
+        self._last_cache_prune: float = 0.0
+        self._started_at: float = time.time()
+        self._runtime_manager = RuntimeManager()
+        self._http_client = SafeHttpClient(
+            self._runtime_manager, _public_url_trace_config
+        )
+        self._update_lock = asyncio.Lock()
         # 停止代次按群/私聊会话隔离，避免 A 群的停止命令中断 B 群任务。
         self._parse_cancel_generation: Dict[str, int] = {}
         self._parsing_lock: Dict[str, bool] = {}  # 解析锁，防止同一链接重复解析
@@ -639,7 +909,7 @@ class BKToolsPlugin(Star):
         if not group_id:
             return {
                 "enabled": bool(group_cfg.get("private_chat_enabled", True)),
-                "config": copy.deepcopy(self.config),
+                "config": _plain_config_value(self.config),
                 "features": features,
                 "scope": scope,
             }
@@ -653,7 +923,7 @@ class BKToolsPlugin(Star):
         else:
             enabled = bool(override.get("enabled", True)) if override else True
 
-        effective = copy.deepcopy(self.config)
+        effective = _plain_config_value(self.config)
         if override:
             feature_cfg = override.get("features", {}) or {}
             if isinstance(feature_cfg, dict):
@@ -676,7 +946,8 @@ class BKToolsPlugin(Star):
                     logger.warning("群 %s 的高级覆盖 JSON 无效: %s", group_id, ex)
             # 群覆盖不能反向修改群控制规则本身。
             parsed_override = dict(parsed_override)
-            parsed_override.pop("group_control", None)
+            for protected_section in ("group_control", "security", "runtime_limits", "updates"):
+                parsed_override.pop(protected_section, None)
             if parsed_override:
                 effective = _deep_merge_dict(effective, parsed_override)
 
@@ -722,6 +993,120 @@ class BKToolsPlugin(Star):
         features = self._runtime_features_var.get() or {}
         return bool(features.get(feature, True))
 
+    def _security_cfg(self) -> Dict[str, Any]:
+        return _cfg(self._runtime_config(), "security", default={}) or {}
+
+    async def _is_management_allowed(self, event: AstrMessageEvent) -> bool:
+        cfg = self._security_cfg()
+        mode = str(cfg.get("management_permission") or "admin_only").lower()
+        if mode == "everyone":
+            return True
+        sender_id = self._event_sender_id(event)
+        configured_admins = {str(x).strip() for x in cfg.get("admin_user_ids", []) if str(x).strip()}
+        if sender_id in configured_admins:
+            return True
+        if mode == "allowlist_only":
+            return False
+        if not self._event_group_id(event) or not bool(cfg.get("allow_group_admins", True)):
+            return False
+        try:
+            group = await event.get_group()
+        except Exception as ex:
+            logger.warning("获取群管理员信息失败: %s", ex)
+            return False
+        if not group:
+            return False
+        owner = str(getattr(group, "group_owner", "") or "")
+        admins = {str(x) for x in (getattr(group, "group_admins", None) or [])}
+        return sender_id == owner or sender_id in admins
+
+    def _scope_concurrency_limit(self) -> int:
+        cfg = self._security_cfg()
+        try:
+            return max(1, min(int(cfg.get("max_concurrent_tasks_per_scope", 2)), 10))
+        except (TypeError, ValueError):
+            return 2
+
+    @asynccontextmanager
+    async def _track_parse_task(self):
+        scope = self._runtime_scope()
+        task = asyncio.current_task()
+        if task is None:
+            yield
+            return
+        tasks = self._active_parse_tasks.setdefault(scope, set())
+        tasks.add(task)
+        self._runtime_manager.register_task(scope)
+        limit = self._scope_concurrency_limit()
+        semaphore = self._scope_semaphores.setdefault(
+            (scope, limit), asyncio.Semaphore(limit)
+        )
+        try:
+            async with semaphore:
+                yield
+        finally:
+            record = self._runtime_manager.tasks.get(task)
+            if record and record.state not in {TaskState.CANCELLED, TaskState.FAILED}:
+                self._runtime_manager.finish_task(task, TaskState.COMPLETED)
+            tasks.discard(task)
+            if not tasks:
+                self._active_parse_tasks.pop(scope, None)
+            self._runtime_manager.remove_task(task)
+
+    def _cancel_scope_tasks(self) -> int:
+        current = asyncio.current_task()
+        tasks = list(self._active_parse_tasks.get(self._runtime_scope(), set()))
+        count = 0
+        for task in tasks:
+            if task is current or task.done():
+                continue
+            task.cancel()
+            count += 1
+        return count
+
+    def _prune_runtime_caches(self, *, force: bool = False) -> None:
+        now = time.time()
+        cfg = self._security_cfg()
+        try:
+            interval = max(10, int(cfg.get("cache_prune_interval_sec", 60)))
+        except (TypeError, ValueError):
+            interval = 60
+        if not force and now - self._last_cache_prune < interval:
+            return
+        self._last_cache_prune = now
+        try:
+            ttl = max(30, int(cfg.get("runtime_cache_ttl_sec", 600)))
+        except (TypeError, ValueError):
+            ttl = 600
+        self._dedup_cache = {
+            key: ts for key, ts in self._dedup_cache.items() if now - ts <= ttl
+        }
+        self._netease_pick_cache = {
+            key: value
+            for key, value in self._netease_pick_cache.items()
+            if now - float(value.get("ts", 0)) <= ttl
+        }
+        for key in [key for key, locked in self._parsing_lock.items() if not locked]:
+            self._parsing_lock.pop(key, None)
+        limits = self._runtime_limits_cfg()
+        try:
+            max_entries = max(32, min(int(limits.get("runtime_cache_max_entries", 1000)), 10000))
+        except (TypeError, ValueError):
+            max_entries = 1000
+        if len(self._dedup_cache) > max_entries:
+            newest = sorted(self._dedup_cache.items(), key=lambda item: item[1], reverse=True)
+            self._dedup_cache = dict(newest[:max_entries])
+        if len(self._netease_pick_cache) > max_entries:
+            newest = sorted(
+                self._netease_pick_cache.items(),
+                key=lambda item: float(item[1].get("ts", 0)),
+                reverse=True,
+            )
+            self._netease_pick_cache = dict(newest[:max_entries])
+        self._runtime_manager.prune(ttl, max_entries)
+        if len(self._alist_uploaders) > 16:
+            self._alist_uploaders.clear()
+
     async def _send_disabled_notice(self, event: AstrMessageEvent) -> None:
         group_cfg = _cfg(self.config, "group_control", default={}) or {}
         text = str(
@@ -759,6 +1144,7 @@ class BKToolsPlugin(Star):
 
     def _check_dedup(self, url: str) -> bool:
         """检查链接是否在去重窗口期内返回 True 表示需要跳过（已解析过）"""
+        self._prune_runtime_caches()
         tr = _cfg(self._runtime_config(), "trigger", default={}) or {}
         if not tr.get("dedup_enable", True):
             return False
@@ -802,6 +1188,17 @@ class BKToolsPlugin(Star):
         # 限制重试范围，避免错误配置导致长时间阻塞或刷屏。
         return max(0, min(retry_count, 5)), max(0, min(delay_ms, 5000)) / 1000
 
+    def _runtime_limits_cfg(self) -> Dict[str, Any]:
+        return _cfg(self._runtime_config(), "runtime_limits", default={}) or {}
+
+    def _http_reliability_cfg(self) -> Dict[str, Any]:
+        return _cfg(self._runtime_config(), "http_reliability", default={}) or {}
+
+    def _send_key(self, label: str, payload: Dict[str, Any]) -> str:
+        raw = json.dumps(payload, ensure_ascii=False, sort_keys=True, default=str)
+        digest = hashlib.sha256(raw.encode("utf-8")).hexdigest()
+        return f"{self._runtime_scope()}:{label}:{digest}"
+
     async def _send_json_result(
         self,
         event: AstrMessageEvent,
@@ -813,18 +1210,41 @@ class BKToolsPlugin(Star):
         if self._is_parse_cancelled(parse_token):
             logger.info("%s前收到停止解析指令，取消发送 JSON", reason)
             return False
+        json_text = json.dumps(
+            payload,
+            ensure_ascii=False,
+            separators=(",", ":"),
+            default=str,
+        )
+        encoded = json_text.encode("utf-8")
+        limits = self._runtime_limits_cfg()
+        text_limit = max(256, int(limits.get("json_text_max_chars", 3500) or 3500))
+        file_limit = max(
+            text_limit,
+            int(limits.get("json_file_max_bytes", 2 * 1024 * 1024) or 0),
+        )
         try:
-            # 使用紧凑 JSON，降低群消息长度限制导致发送失败的概率。
-            json_text = json.dumps(
-                payload,
-                ensure_ascii=False,
-                separators=(",", ":"),
-                default=str,
-            )
-            await event.send(event.plain_result(json_text))
+            self._runtime_manager.set_state(TaskState.SENDING)
+            if len(json_text) <= text_limit:
+                await event.send(event.plain_result(json_text))
+                return True
+            if len(encoded) > file_limit:
+                raise ValueError("解析 JSON 超过文件回退大小限制")
+            if File is None:
+                raise RuntimeError("当前 AstrBot 版本不支持文件消息组件")
+            path = create_json_temp(encoded)
+            self._runtime_manager.register_temp(self._runtime_scope(), path)
+            file_node = _make_file_node(path, "bktools-result.json")
+            if file_node is None:
+                raise RuntimeError("当前平台无法构造文件消息")
+            await event.send(event.chain_result([file_node]))
             return True
         except Exception as ex:
             logger.error("%s，发送解析 JSON 失败: %s", reason, ex)
+            try:
+                await event.send(event.plain_result("解析结果发送失败，请稍后重试或联系管理员查看诊断信息。"))
+            except Exception:
+                logger.error("发送 JSON 失败提示也失败: %s", reason)
             return False
 
     async def _send_packed_or_json(
@@ -836,6 +1256,10 @@ class BKToolsPlugin(Star):
         label: str,
     ) -> bool:
         """合并转发失败时重试；全部失败后只发送原始 JSON。"""
+        send_key = self._send_key(label, raw_json)
+        if not self._runtime_manager.claim_send(send_key):
+            logger.info("跳过重复发送: %s", label)
+            return False
         if not forward_nodes:
             logger.warning("%s没有可用的合并转发节点，直接发送解析 JSON", label)
             return await self._send_json_result(
@@ -851,6 +1275,7 @@ class BKToolsPlugin(Star):
                 logger.info("%s发送前收到停止解析指令", label)
                 return False
             try:
+                self._runtime_manager.set_state(TaskState.SENDING)
                 await event.send(event.chain_result([Nodes(forward_nodes)]))
                 return True
             except Exception as ex:
@@ -896,6 +1321,7 @@ class BKToolsPlugin(Star):
     def _cache_pick_candidates(
         self, event: AstrMessageEvent, keyword: str, candidates: List[Dict[str, Any]]
     ) -> None:
+        self._prune_runtime_caches()
         self._netease_pick_cache[self._event_scope_key(event)] = {
             "keyword": keyword,
             "items": candidates,
@@ -987,38 +1413,68 @@ class BKToolsPlugin(Star):
     async def _session_get_json(
         self, session: aiohttp.ClientSession, url: str
     ) -> Dict[str, Any]:
-        async with session.get(url) as resp:
-            raw = await resp.read()
-            return self._loads_response_json(raw)
+        return await self._request_json("GET", url)
 
     async def _session_post_form(
         self, session: aiohttp.ClientSession, url: str, data: Dict[str, Any]
     ) -> Dict[str, Any]:
-        async with session.post(url, data=data) as resp:
-            raw = await resp.read()
-            return self._loads_response_json(raw)
+        return await self._request_json("POST", url, data=data)
+
+    async def _request_json(self, method: str, url: str, **kwargs: Any) -> Dict[str, Any]:
+        timeout_sec, ua = self._http_cfg()
+        reliability = self._http_reliability_cfg()
+        limits = self._runtime_limits_cfg()
+        raw = await self._http_client.request_bytes(
+            method,
+            url,
+            timeout_sec=timeout_sec,
+            user_agent=ua,
+            max_response_bytes=max(
+                64 * 1024,
+                int(limits.get("max_api_response_bytes", 5 * 1024 * 1024) or 0),
+            ),
+            retries=max(0, min(int(reliability.get("retry_count", 2) or 0), 5)),
+            backoff_sec=max(
+                0.0, min(float(reliability.get("retry_backoff_ms", 500) or 0) / 1000, 10.0)
+            ),
+            circuit_threshold=max(
+                1, min(int(reliability.get("circuit_failure_threshold", 5) or 5), 20)
+            ),
+            circuit_recovery_sec=max(
+                5, min(int(reliability.get("circuit_recovery_sec", 60) or 60), 3600)
+            ),
+            **kwargs,
+        )
+        return self._loads_response_json(raw)
 
     async def _resolve_url_redirect(self, url: str, timeout_sec: int = 10) -> str:
-        """通用重定向展开（用于短链接解析）。失败时返回原链接。"""
+        """仅展开受支持平台的公网 HTTP(S) 短链接。"""
         u = (url or "").strip()
-        if not u:
+        if not u or not _supported_share_url(u):
             return u
+        _, ua = self._http_cfg()
         try:
-            async with aiohttp.ClientSession() as session:
-                async with session.head(u, allow_redirects=True, timeout=aiohttp.ClientTimeout(total=timeout_sec)) as resp:
-                    final_u = str(resp.url)
-                    if final_u:
-                        return final_u
-        except Exception:
-            pass
+            safe_url = await _validate_public_http_url(u)
+            session = await self._http_client.get_session(timeout_sec, ua)
+            async with session.head(
+                safe_url, allow_redirects=True, max_redirects=5
+            ) as resp:
+                final_u = str(resp.url)
+                if final_u:
+                    return final_u
+        except Exception as ex:
+            logger.debug("安全展开短链接 HEAD 失败: %s", ex)
         try:
-            async with aiohttp.ClientSession() as session:
-                async with session.get(u, allow_redirects=True, timeout=aiohttp.ClientTimeout(total=timeout_sec)) as resp:
-                    final_u = str(resp.url)
-                    if final_u:
-                        return final_u
-        except Exception:
-            pass
+            safe_url = await _validate_public_http_url(u)
+            session = await self._http_client.get_session(timeout_sec, ua)
+            async with session.get(
+                safe_url, allow_redirects=True, max_redirects=5
+            ) as resp:
+                final_u = str(resp.url)
+                if final_u:
+                    return final_u
+        except Exception as ex:
+            logger.debug("安全展开短链接 GET 失败: %s", ex)
         return u
 
     async def _fetch_short_video(self, link: str) -> Tuple[Dict[str, Any], Dict[str, Any]]:
@@ -1028,16 +1484,12 @@ class BKToolsPlugin(Star):
             raise ValueError("未配置短视频 endpoint")
         param = cfg_sv.get("url_param_name") or "url"
         method = (cfg_sv.get("request_method") or "GET").upper()
-        timeout_sec, ua = self._http_cfg()
-        headers = {"User-Agent": ua}
-        to = aiohttp.ClientTimeout(total=timeout_sec)
-        async with aiohttp.ClientSession(timeout=to, headers=headers) as session:
-            if method == "POST":
-                j = await self._session_post_form(session, endpoint, {param: link})
-            else:
-                q = urlencode({param: link})
-                sep = "&" if "?" in endpoint else "?"
-                j = await self._session_get_json(session, f"{endpoint}{sep}{q}")
+        if method == "POST":
+            j = await self._request_json("POST", endpoint, data={param: link})
+        else:
+            q = urlencode({param: link})
+            sep = "&" if "?" in endpoint else "?"
+            j = await self._request_json("GET", f"{endpoint}{sep}{q}")
         path_root = (cfg_sv.get("path_data_root") or "data").strip() or "data"
         data = get_path(j, path_root)
         if not isinstance(data, dict):
@@ -1085,6 +1537,7 @@ class BKToolsPlugin(Star):
                 lines.append(f"原声链接：{mu}")
         return "\n".join(lines) if lines else "（无文本信息）"
 
+    @_tracked_parse
     async def _reply_short_video(self, event: AstrMessageEvent, link: str) -> None:
         parse_token = self._new_parse_token()
         await self._maybe_opening(event)
@@ -1105,6 +1558,8 @@ class BKToolsPlugin(Star):
         if self._is_parse_cancelled(parse_token):
             logger.info("短视频解析在接口返回后被停止: %s", link)
             return
+
+        self._runtime_manager.set_state(TaskState.BUILDING)
 
         cfg_sv = _cfg(self._runtime_config(), "short_video", default={}) or {}
         msg_cfg = _cfg(self._runtime_config(), "message", default={}) or {}
@@ -1318,16 +1773,12 @@ class BKToolsPlugin(Star):
             raise ValueError("未配置短视频 endpoint")
         param = cfg_sv.get("url_param_name") or "url"
         method = (cfg_sv.get("request_method") or "GET").upper()
-        timeout_sec, ua = self._http_cfg()
-        headers = {"User-Agent": ua}
-        to = aiohttp.ClientTimeout(total=timeout_sec)
-        async with aiohttp.ClientSession(timeout=to, headers=headers) as session:
-            if method == "POST":
-                j = await self._session_post_form(session, endpoint, {param: profile_url})
-            else:
-                q = urlencode({param: profile_url})
-                sep = "&" if "?" in endpoint else "?"
-                j = await self._session_get_json(session, f"{endpoint}{sep}{q}")
+        if method == "POST":
+            j = await self._request_json("POST", endpoint, data={param: profile_url})
+        else:
+            q = urlencode({param: profile_url})
+            sep = "&" if "?" in endpoint else "?"
+            j = await self._request_json("GET", f"{endpoint}{sep}{q}")
         ok = _parse_success_codes(str(cfg_sv.get("success_codes", "200")))
         if not _code_ok(j, cfg_sv.get("path_code") or "code", ok):
             msg = get_path(j, cfg_sv.get("path_msg") or "msg") or "接口返回失败"
@@ -1375,6 +1826,7 @@ class BKToolsPlugin(Star):
             lines.append(f"🎵 原声：{mt} - {ma}" if mt and ma else f"🎵 原声：{mt or ma}")
         return "\n".join(lines)
 
+    @_tracked_parse
     async def _reply_douyin_profile(self, event: AstrMessageEvent, profile_url: str) -> None:
         parse_token = self._new_parse_token()
         await self._maybe_opening(event)
@@ -1465,6 +1917,7 @@ class BKToolsPlugin(Star):
             except Exception as ex:
                 logger.warning("发送节点失败: %s", ex)
 
+    @_tracked_parse
     async def _netease_search(self, event: AstrMessageEvent, keyword: str) -> None:
         ne = _cfg(self._runtime_config(), "netease", default={}) or {}
         ep = (ne.get("search_endpoint") or "").strip()
@@ -1486,17 +1939,13 @@ class BKToolsPlugin(Star):
         if isinstance(extra, dict) and "type" not in extra and "Type" not in extra:
             extra = {"type": "search", **extra}
         params = {**extra, kparam: keyword}
-        timeout_sec, ua = self._http_cfg()
-        headers = {"User-Agent": ua}
-        to = aiohttp.ClientTimeout(total=timeout_sec)
         try:
-            async with aiohttp.ClientSession(timeout=to, headers=headers) as session:
-                if method == "POST":
-                    j = await self._session_post_form(session, ep, params)
-                else:
-                    q = urlencode(params, quote_via=quote_plus)
-                    sep = "&" if "?" in ep else "?"
-                    j = await self._session_get_json(session, f"{ep}{sep}{q}")
+            if method == "POST":
+                j = await self._request_json("POST", ep, data=params)
+            else:
+                q = urlencode(params, quote_via=quote_plus)
+                sep = "&" if "?" in ep else "?"
+                j = await self._request_json("GET", f"{ep}{sep}{q}")
         except Exception as e:
             logger.warning("网易云搜索失败: %s", e)
             await event.send(event.plain_result(f"网易云搜索失败：{e}"))
@@ -1556,6 +2005,7 @@ class BKToolsPlugin(Star):
         )
         await event.send(event.plain_result(header))
 
+    @_tracked_parse
     async def _music_link_parse(self, event: AstrMessageEvent, link: str) -> None:
         plat = _music_platform(link)
         ne = _cfg(self._runtime_config(), "netease", default={}) or {}
@@ -1827,6 +2277,241 @@ class BKToolsPlugin(Star):
                     return t[len(p) :].strip()
         return ""
 
+    def _updates_cfg(self) -> Dict[str, Any]:
+        return _cfg(self.config, "updates", default={}) or {}
+
+    async def _github_bytes(self, url: str, max_bytes: int) -> bytes:
+        safe_url = await _validate_public_http_url(url)
+        timeout_sec, ua = self._http_cfg()
+        reliability = self._http_reliability_cfg()
+        return await self._http_client.request_bytes(
+            "GET",
+            safe_url,
+            timeout_sec=max(10, timeout_sec),
+            user_agent=ua,
+            max_response_bytes=max_bytes,
+            retries=max(0, min(int(reliability.get("retry_count", 2) or 0), 3)),
+            backoff_sec=max(
+                0.0, min(float(reliability.get("retry_backoff_ms", 500) or 0) / 1000, 5.0)
+            ),
+            circuit_threshold=max(
+                1, min(int(reliability.get("circuit_failure_threshold", 5) or 5), 20)
+            ),
+            circuit_recovery_sec=max(
+                5, min(int(reliability.get("circuit_recovery_sec", 60) or 60), 3600)
+            ),
+            allow_redirects=True,
+            max_redirects=5,
+        )
+
+    async def _check_github_update(self) -> UpdateInfo:
+        release_error: Optional[Exception] = None
+        try:
+            raw = await self._github_bytes(f"{GITHUB_API}/releases/latest", 1024 * 1024)
+            release = self._loads_response_json(raw)
+            latest = str(release.get("tag_name") or "").strip()
+            download_url = str(release.get("zipball_url") or "").strip()
+            if latest and download_url:
+                compare_versions(latest, PLUGIN_VERSION)
+                return UpdateInfo(
+                    current_version=f"v{PLUGIN_VERSION}",
+                    latest_version=latest,
+                    download_url=download_url,
+                    source="GitHub Release",
+                    release_url=str(release.get("html_url") or ""),
+                    notes=str(release.get("body") or "")[:1000],
+                )
+        except Exception as ex:
+            release_error = ex
+            logger.info("读取 GitHub Release 失败，回退到默认分支: %s", ex)
+
+        try:
+            repo_raw = await self._github_bytes(GITHUB_API, 512 * 1024)
+            repo_info = self._loads_response_json(repo_raw)
+            branch = str(repo_info.get("default_branch") or "main").strip()
+            if not re.fullmatch(r"[0-9A-Za-z._/-]+", branch) or ".." in branch:
+                raise ValueError("GitHub 默认分支名称异常")
+            metadata_url = (
+                f"https://raw.githubusercontent.com/{REPOSITORY}/{branch}/metadata.yaml"
+            )
+            metadata_raw = await self._github_bytes(metadata_url, 128 * 1024)
+            latest = metadata_version(metadata_raw.decode("utf-8-sig"))
+            return UpdateInfo(
+                current_version=f"v{PLUGIN_VERSION}",
+                latest_version=latest,
+                download_url=f"https://codeload.github.com/{REPOSITORY}/zip/refs/heads/{branch}",
+                source=f"GitHub {branch} 分支",
+                release_url=f"https://github.com/{REPOSITORY}",
+            )
+        except Exception as branch_error:
+            raise RuntimeError(
+                f"无法检查 GitHub 更新；Release: {release_error or '无可用版本'}；仓库分支: {branch_error}"
+            ) from branch_error
+
+    @filter.command("bk版本")
+    @_event_scoped()
+    async def cmd_version(self, event: AstrMessageEvent):
+        """显示插件版本与更新仓库。"""
+        await event.send(
+            event.plain_result(
+                f"BKtools v{PLUGIN_VERSION}\n"
+                f"更新仓库：https://github.com/{REPOSITORY}\n"
+                "管理员可使用 /bk检查更新 和 /bk更新插件。"
+            )
+        )
+
+    @filter.command("bk检查更新")
+    @_event_scoped()
+    @_management_only
+    async def cmd_check_update(self, event: AstrMessageEvent):
+        """从官方 GitHub 仓库检查新版本。"""
+        try:
+            info = await self._check_github_update()
+            if info.available:
+                text = (
+                    f"发现 BKtools 新版本：{info.latest_version}\n"
+                    f"当前版本：v{PLUGIN_VERSION}\n来源：{info.source}\n"
+                    "使用 /bk更新插件 可下载并安装，安装后必须重启 AstrBot。"
+                )
+            else:
+                text = f"BKtools 当前已是最新版本：v{PLUGIN_VERSION}（{info.source}）"
+            await event.send(event.plain_result(text))
+        except Exception as ex:
+            logger.warning("检查插件更新失败: %s", ex)
+            await event.send(event.plain_result(f"检查更新失败：{ex}"))
+
+    @filter.command("bk更新插件")
+    @_event_scoped()
+    @_management_only
+    async def cmd_update_plugin(self, event: AstrMessageEvent):
+        """从官方 GitHub 仓库下载、验证、备份并安装新版本。"""
+        cfg = self._updates_cfg()
+        if not bool(cfg.get("self_update_enabled", True)):
+            await event.send(event.plain_result("插件自更新已在后台配置中关闭。"))
+            return
+        if self._update_lock.locked():
+            await event.send(event.plain_result("已有插件更新任务正在执行，请稍后再试。"))
+            return
+        async with self._update_lock:
+            try:
+                info = await self._check_github_update()
+                if not info.available:
+                    await event.send(event.plain_result(f"当前已是最新版本：v{PLUGIN_VERSION}"))
+                    return
+                max_mb = max(1, min(int(cfg.get("max_download_mb", 20) or 20), 100))
+                archive = await self._github_bytes(info.download_url, max_mb * 1024 * 1024)
+                backup, count = await asyncio.to_thread(
+                    install_archive,
+                    archive,
+                    os.path.dirname(os.path.abspath(__file__)),
+                    expected_version=info.latest_version,
+                )
+                await event.send(
+                    event.plain_result(
+                        f"BKtools 已更新到 {info.latest_version}，共替换 {count} 个文件。\n"
+                        f"备份目录：{backup}\n"
+                        "请立即完整重启 AstrBot 后再继续使用插件。"
+                    )
+                )
+            except Exception as ex:
+                logger.exception("插件自更新失败")
+                await event.send(event.plain_result(f"插件更新失败，已尽量回滚：{ex}"))
+
+    @filter.command("bk状态")
+    @_event_scoped()
+    @_management_only
+    async def cmd_status(self, event: AstrMessageEvent):
+        """查看当前群/会话的有效配置与运行状态。"""
+        self._prune_runtime_caches(force=True)
+        cfg = self._runtime_config()
+        features = self._runtime_features_var.get() or {}
+        trigger = _cfg(cfg, "trigger", default={}) or {}
+        message = _cfg(cfg, "message", default={}) or {}
+        group_control = _cfg(self.config, "group_control", default={}) or {}
+        scope = self._runtime_scope()
+        active = len(self._active_parse_tasks.get(scope, set()))
+        states = self._runtime_manager.state_counts(scope)
+        state_text = "、".join(f"{key}={value}" for key, value in sorted(states.items())) or "无"
+        open_circuits = sum(
+            1 for state in self._runtime_manager.circuits.values() if state.opened_until > time.time()
+        )
+        uptime = max(0, int(time.time() - self._started_at))
+        feature_text = "、".join(
+            name
+            for key, name in (
+                ("short_video", "短视频"),
+                ("douyin_profile", "抖音主页"),
+                ("netease", "网易云"),
+                ("music", "音乐链接"),
+            )
+            if features.get(key, True)
+        ) or "无"
+        text = (
+            "【BKtools 当前状态】\n"
+            f"会话：{scope}\n"
+            f"群聊模式：{group_control.get('mode', 'all')}\n"
+            f"可用功能：{feature_text}\n"
+            f"自动短视频：{bool(trigger.get('auto_short_video', True))}\n"
+            f"自动主页：{bool(trigger.get('auto_douyin_profile', True))}\n"
+            f"自动音乐：{bool(trigger.get('auto_music_link', True))}\n"
+            f"合并转发：{bool(message.get('pack_forward', True))}\n"
+            f"活动解析任务：{active}\n"
+            f"任务状态：{state_text}\n"
+            f"接口熔断：{open_circuits}\n"
+            f"HTTP 会话：{'已连接' if self._http_client.session and not self._http_client.session.closed else '未建立'}\n"
+            f"去重缓存：{len(self._dedup_cache)}\n"
+            f"点歌缓存：{len(self._netease_pick_cache)}\n"
+            f"运行时长：{uptime // 3600} 小时 {(uptime % 3600) // 60} 分钟"
+        )
+        await event.send(event.plain_result(text))
+
+    @filter.command("bk诊断")
+    @_event_scoped()
+    @_management_only
+    async def cmd_diagnostics(self, event: AstrMessageEvent):
+        """检查依赖、接口配置与关键安全控制。"""
+        cfg = self._runtime_config()
+        checks: List[str] = []
+        for label, path in (
+            ("短视频接口", ("short_video", "endpoint")),
+            ("网易云搜索", ("netease", "search_endpoint")),
+            ("网易云解析", ("netease", "link_parse_endpoint")),
+        ):
+            value = str(_cfg(cfg, *path, default="") or "").strip()
+            parsed = urlparse(value)
+            ok = bool(value and parsed.scheme in {"http", "https"} and parsed.hostname)
+            checks.append(f"{'✅' if ok else '❌'} {label}：{'已配置' if ok else '地址无效或为空'}")
+        checks.append(f"{'✅' if shutil.which('ffmpeg') else '⚠️'} ffmpeg：{'可用' if shutil.which('ffmpeg') else '未找到，语音转换不可用'}")
+        try:
+            import pydub  # noqa: F401
+            pydub_ok = True
+        except ImportError:
+            pydub_ok = False
+        checks.append(f"{'✅' if pydub_ok else '⚠️'} pydub：{'可用' if pydub_ok else '未安装，语音转换不可用'}")
+        try:
+            await _validate_public_http_url("http://127.0.0.1/")
+        except ValueError:
+            ssrf_ok = True
+        else:
+            ssrf_ok = False
+        checks.append(f"{'✅' if ssrf_ok else '❌'} URL 安全防护：{'正常' if ssrf_ok else '异常'}")
+        now = time.time()
+        opened = [
+            state for state in self._runtime_manager.circuits.values()
+            if state.opened_until > now
+        ]
+        failures = sum(state.failures for state in self._runtime_manager.circuits.values())
+        last_errors = [state.last_error for state in self._runtime_manager.circuits.values() if state.last_error]
+        checks.append(f"{'⚠️' if opened else '✅'} 接口健康：失败计数 {failures}，熔断 {len(opened)}")
+        if last_errors:
+            sanitized = re.sub(r"https?://[^\s]+", "[URL已隐藏]", last_errors[-1])
+            checks.append(f"ℹ️ 最近错误：{sanitized[:160]}")
+        alist_cfg = _cfg(cfg, "alist", default={}) or {}
+        if alist_cfg.get("enable"):
+            alist_ok = all(alist_cfg.get(key) for key in ("url", "username", "password"))
+            checks.append(f"{'✅' if alist_ok else '❌'} Alist：{'配置完整' if alist_ok else '缺少地址或账号密码'}")
+        await event.send(event.plain_result("【BKtools 诊断】\n" + "\n".join(checks)))
+
     @filter.command("bk帮助")
     @_event_scoped()
     async def cmd_help(self, event: AstrMessageEvent):
@@ -1839,6 +2524,13 @@ class BKToolsPlugin(Star):
                 "· /bk网易云 <关键词> — 仅网易云搜索（需配置搜索接口）\n"
                 "· /bk点歌 <序号> — 选择最近一次网易云搜索结果\n"
                 "· /bk音乐 <音乐分享链接> — QQ/汽水/酷我/网易等链接解析（无搜索）\n"
+                "· /bk状态 — 查看当前群有效配置与任务状态（管理员）\n"
+                "· /bk诊断 — 检查接口、依赖和安全防护（管理员）\n"
+                "· /bk版本 — 查看当前版本和更新仓库\n"
+                "· /bk检查更新 — 检查 GitHub 新版本（管理员）\n"
+                "· /bk更新插件 — 从官方 GitHub 仓库安全更新（管理员）\n"
+                "· /bk停止解析 — 停止当前群或私聊会话中的解析任务\n"
+                "· /bk清理缓存 — 清理插件临时音频文件\n"
                 "短视频：默认合并转发（Nodes），纯图集会合并图片节点，"
                 "含视频时用 Video.fromURL，详见 message / short_video 配置项。\n"
                 "语音消息：可在配置中开启 send_voice_message，自动将音乐转换为语音消息发送。\n"
@@ -1927,55 +2619,34 @@ class BKToolsPlugin(Star):
 
     @filter.command("bk清理缓存")
     @_event_scoped()
+    @_management_only
     async def cmd_cleanup_cache(self, event: AstrMessageEvent):
         """清理本插件的临时缓存文件"""
         try:
-            cache_dir = tempfile.gettempdir()
-            prefix = "bktools_audio_"
-            count = 0
-            size = 0
-            for f in os.listdir(cache_dir):
-                if f.startswith(prefix):
-                    path = os.path.join(cache_dir, f)
-                    try:
-                        size += os.path.getsize(path)
-                        os.unlink(path)
-                        count += 1
-                    except Exception:
-                        pass
+            count, size = _cleanup_temp_files()
+            self._prune_runtime_caches(force=True)
             await event.send(event.plain_result(f"已清理 {count} 个缓存文件，释放 {size / 1024 / 1024:.2f} MB"))
         except Exception as e:
             await event.send(event.plain_result(f"清理失败: {str(e)}"))
 
     @filter.command("bk停止解析")
     @_event_scoped()
+    @_management_only
     async def cmd_stop_parsing(self, event: AstrMessageEvent):
-        """强制停止当前解析任务、截断输出并清理缓存"""
-        # 递增取消代次，所有已经启动的短视频/主页解析都会在下一个检查点退出；
-        # 新启动的任务使用新代次，不会反向恢复旧任务。
+        """停止当前群或私聊会话的解析任务、截断输出并清理缓存"""
+        # 递增当前会话取消代次；其他群和私聊会话不受影响。
         self._cancel_active_parses()
+        cancelled_tasks = self._cancel_scope_tasks()
 
         # 清理缓存文件
         try:
-            cache_dir = tempfile.gettempdir()
-            prefix = "bktools_audio_"
-            count = 0
-            size = 0
-            for f in os.listdir(cache_dir):
-                if f.startswith(prefix):
-                    path = os.path.join(cache_dir, f)
-                    try:
-                        size += os.path.getsize(path)
-                        os.unlink(path)
-                        count += 1
-                    except Exception:
-                        pass
+            count, size = _cleanup_temp_files()
             if count > 0:
-                await event.send(event.plain_result(f"已强制停止解析，已清理 {count} 个缓存文件，释放 {size / 1024 / 1024:.2f} MB"))
+                await event.send(event.plain_result(f"已停止当前会话解析任务 {cancelled_tasks} 个，已清理 {count} 个缓存文件，释放 {size / 1024 / 1024:.2f} MB"))
             else:
-                await event.send(event.plain_result("已强制停止解析"))
+                await event.send(event.plain_result(f"已停止当前会话解析任务 {cancelled_tasks} 个"))
         except Exception as e:
-            await event.send(event.plain_result(f"已强制停止解析，但清理缓存失败: {str(e)}"))
+            await event.send(event.plain_result(f"已停止当前会话解析，但清理缓存失败: {str(e)}"))
 
     @filter.event_message_type(EventMessageType.ALL)
     @_event_scoped(silent=True)
@@ -2020,13 +2691,14 @@ class BKToolsPlugin(Star):
                         return
                     self._parsing_lock[lock_key] = True
                     if self._check_dedup(orig):
-                        self._parsing_lock[lock_key] = False
+                        self._parsing_lock.pop(lock_key, None)
                         return
                     try:
                         await self._music_link_parse(event, orig)
                     finally:
-                        self._parsing_lock[lock_key] = False
+                        self._parsing_lock.pop(lock_key, None)
                     return
+
                 if _matched(_music_platform, orig, resolved):
                     # 使用解析锁防止重复解析
                     lock_key = f"{runtime_scope}:music_link:{orig}"
@@ -2035,12 +2707,12 @@ class BKToolsPlugin(Star):
                         return
                     self._parsing_lock[lock_key] = True
                     if self._check_dedup(orig):
-                        self._parsing_lock[lock_key] = False
+                        self._parsing_lock.pop(lock_key, None)
                         return
                     try:
                         await self._music_link_parse(event, orig)
                     finally:
-                        self._parsing_lock[lock_key] = False
+                        self._parsing_lock.pop(lock_key, None)
                     return
 
         for i, resolved in enumerate(resolved_urls):
@@ -2055,12 +2727,12 @@ class BKToolsPlugin(Star):
                         return
                     self._parsing_lock[lock_key] = True
                     if self._check_dedup(orig):
-                        self._parsing_lock[lock_key] = False
+                        self._parsing_lock.pop(lock_key, None)
                         return
                     try:
                         await self._reply_douyin_profile(event, orig)
                     finally:
-                        self._parsing_lock[lock_key] = False
+                        self._parsing_lock.pop(lock_key, None)
                     return
 
         for i, resolved in enumerate(resolved_urls):
@@ -2075,10 +2747,32 @@ class BKToolsPlugin(Star):
                         return
                     self._parsing_lock[lock_key] = True
                     if self._check_dedup(orig):
-                        self._parsing_lock[lock_key] = False
+                        self._parsing_lock.pop(lock_key, None)
                         return
                     try:
                         await self._reply_short_video(event, orig)
                     finally:
-                        self._parsing_lock[lock_key] = False
+                        self._parsing_lock.pop(lock_key, None)
                     return
+
+    async def terminate(self):
+        """卸载插件时取消活动任务并释放运行时缓存。"""
+        tasks = [
+            task
+            for scope_tasks in self._active_parse_tasks.values()
+            for task in scope_tasks
+            if not task.done()
+        ]
+        for task in tasks:
+            task.cancel()
+        if tasks:
+            await asyncio.gather(*tasks, return_exceptions=True)
+        self._active_parse_tasks.clear()
+        self._scope_semaphores.clear()
+        self._dedup_cache.clear()
+        self._netease_pick_cache.clear()
+        self._parsing_lock.clear()
+        self._alist_uploaders.clear()
+        self._runtime_manager.cleanup_all()
+        await self._http_client.close()
+        _cleanup_temp_files()

@@ -13,6 +13,8 @@ ROOT_NAME = "astrbot_plugin_bktools"
 OUT_NAME = f"{ROOT_NAME}.zip"
 MANUAL_REL = os.path.join("manual_upload", ROOT_NAME)
 PLUGIN_FILES = (
+    "bktools_runtime.py",
+    "bktools_updater.py",
     "CHANGELOG.md",
     "README.md",
     "_conf_schema.json",

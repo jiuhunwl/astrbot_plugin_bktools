@@ -1,7 +1,7 @@
 name: astrbot_plugin_bktools
 display_name: BKtools（BugPk 工具集）
-desc: 基于 BugPk 公益接口的短视频解析、音乐搜索与解析；接口地址与 JSON 字段路径可在后台配置。
-version: v1.2.9
+desc: 支持群级配置、幂等发送、接口重试熔断和 URL 安全防护的短视频与音乐解析插件。
+version: v1.6.0
 author: jiuhunwl
 repo: https://github.com/jiuhunwl/astrbot_plugin_bktools
 icon: https://static.esa.ifphp.com/img/bugpk-Api-256×256.ico

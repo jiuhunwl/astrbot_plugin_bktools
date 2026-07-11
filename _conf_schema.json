@@ -1,4 +1,244 @@
 {
+  "group_control": {
+    "description": "👥 群聊启用范围与单群配置",
+    "type": "object",
+    "hint": "默认对所有群启用。可切换为仅配置的群启用，也可为任意群单独覆盖功能和参数。",
+    "items": {
+      "mode": {
+        "description": "群聊启用模式",
+        "type": "string",
+        "options": [
+          "all",
+          "selected"
+        ],
+        "labels": [
+          "所有群默认启用",
+          "仅单群配置列表中的群启用"
+        ],
+        "default": "all",
+        "hint": "不做任何设置时保持“所有群默认启用”，与旧版本行为一致。",
+        "obvious_hint": true
+      },
+      "private_chat_enabled": {
+        "description": "允许私聊使用插件",
+        "type": "bool",
+        "default": true,
+        "hint": "此开关独立于群聊启用模式。"
+      },
+      "disabled_message": {
+        "description": "未启用时的命令提示",
+        "type": "string",
+        "default": "当前群未启用 BKtools，请联系管理员调整插件群聊设置。",
+        "hint": "自动识别链接时保持静默；用户主动执行命令时发送此提示。"
+      },
+      "group_overrides": {
+        "description": "单群配置列表",
+        "type": "template_list",
+        "hint": "“所有群默认启用”模式下用于单群覆盖或禁用；“仅配置群启用”模式下，此列表同时作为群白名单。",
+        "templates": {
+          "group": {
+            "name": "添加单群配置",
+            "hint": "填写群号后，可控制该群是否启用插件、开放哪些功能，以及覆盖消息和解析参数。",
+            "display_item": "group_id",
+            "hide_hint_in_list": true,
+            "items": {
+              "group_id": {
+                "description": "群号 / 群聊 ID",
+                "type": "string",
+                "default": "",
+                "hint": "QQ 群填写群号；其他平台填写 AstrBot 事件中的 group_id。",
+                "obvious_hint": true
+              },
+              "platform": {
+                "description": "平台名称（可选）",
+                "type": "string",
+                "default": "",
+                "hint": "留空匹配任意平台；需要区分同名群 ID 时填写 aiocqhttp、telegram、discord 等。"
+              },
+              "enabled": {
+                "description": "该群启用插件",
+                "type": "bool",
+                "default": true,
+                "hint": "所有群模式下可关闭某个群；仅配置群模式下必须开启才属于白名单。"
+              },
+              "features": {
+                "description": "该群可用功能",
+                "type": "object",
+                "hint": "关闭后，自动解析与对应手动命令都会在该群停用。",
+                "items": {
+                  "short_video": {
+                    "description": "短视频作品解析",
+                    "type": "bool",
+                    "default": true
+                  },
+                  "douyin_profile": {
+                    "description": "抖音主页作品列表",
+                    "type": "bool",
+                    "default": true
+                  },
+                  "netease": {
+                    "description": "网易云搜歌与点歌",
+                    "type": "bool",
+                    "default": true
+                  },
+                  "music": {
+                    "description": "音乐分享链接解析",
+                    "type": "bool",
+                    "default": true
+                  }
+                }
+              },
+              "behavior": {
+                "description": "常用行为覆盖",
+                "type": "object",
+                "hint": "“继承全局”会使用设置页其他分组中的全局值。",
+                "items": {
+                  "auto_short_video": {
+                    "description": "自动解析短视频",
+                    "type": "string",
+                    "options": ["inherit", "enable", "disable"],
+                    "labels": ["继承全局", "强制开启", "强制关闭"],
+                    "default": "inherit"
+                  },
+                  "auto_douyin_profile": {
+                    "description": "自动解析抖音主页",
+                    "type": "string",
+                    "options": ["inherit", "enable", "disable"],
+                    "labels": ["继承全局", "强制开启", "强制关闭"],
+                    "default": "inherit"
+                  },
+                  "auto_music_link": {
+                    "description": "自动解析音乐链接",
+                    "type": "string",
+                    "options": ["inherit", "enable", "disable"],
+                    "labels": ["继承全局", "强制开启", "强制关闭"],
+                    "default": "inherit"
+                  },
+                  "pack_forward": {
+                    "description": "合并转发",
+                    "type": "string",
+                    "options": ["inherit", "enable", "disable"],
+                    "labels": ["继承全局", "强制开启", "强制关闭"],
+                    "default": "inherit"
+                  },
+                  "opening_enable": {
+                    "description": "“正在解析”提示",
+                    "type": "string",
+                    "options": ["inherit", "enable", "disable"],
+                    "labels": ["继承全局", "强制开启", "强制关闭"],
+                    "default": "inherit"
+                  },
+                  "send_voice_message": {
+                    "description": "音乐语音消息",
+                    "type": "string",
+                    "options": ["inherit", "enable", "disable"],
+                    "labels": ["继承全局", "强制开启", "强制关闭"],
+                    "default": "inherit"
+                  },
+                  "force_link_enabled": {
+                    "description": "视频始终发送直链",
+                    "type": "string",
+                    "options": ["inherit", "enable", "disable"],
+                    "labels": ["继承全局", "强制开启", "强制关闭"],
+                    "default": "inherit"
+                  },
+                  "direct_json_enabled": {
+                    "description": "大批量内容直接发 JSON",
+                    "type": "string",
+                    "options": ["inherit", "enable", "disable"],
+                    "labels": ["继承全局", "强制开启", "强制关闭"],
+                    "default": "inherit"
+                  }
+                }
+              },
+              "override_json": {
+                "description": "高级配置覆盖（JSON）",
+                "type": "string",
+                "default": "{}",
+                "editor_mode": true,
+                "editor_language": "json",
+                "editor_theme": "vs-light",
+                "hint": "可覆盖业务配置，例如 {\"message\":{\"max_images_per_work\":3},\"video_threshold\":{\"threshold_mb\":50}}。出于安全原因不能覆盖 group_control 和 security；常用行为选择项优先级更高。"
+              }
+            }
+          }
+        }
+      }
+    }
+  },
+  "security": {
+    "description": "🛡️ 权限、安全与资源限制",
+    "type": "object",
+    "hint": "保护管理命令、限制单群并发，并定期清理长期运行产生的内存缓存。URL 公网校验始终启用。",
+    "items": {
+      "management_permission": {
+        "description": "管理命令权限",
+        "type": "string",
+        "options": ["admin_only", "allowlist_only", "everyone"],
+        "labels": ["群主/群管理员或授权用户", "仅授权用户列表", "所有成员（不推荐）"],
+        "default": "admin_only",
+        "hint": "控制 /bk停止解析、/bk清理缓存、/bk状态 和 /bk诊断。",
+        "obvious_hint": true
+      },
+      "allow_group_admins": {
+        "description": "允许群主和群管理员使用管理命令",
+        "type": "bool",
+        "default": true,
+        "condition": {
+          "management_permission": "admin_only"
+        }
+      },
+      "admin_user_ids": {
+        "description": "全局授权用户 ID",
+        "type": "list",
+        "default": [],
+        "hint": "每行填写一个用户 ID。授权用户可在群聊和私聊中执行管理命令。"
+      },
+      "max_concurrent_tasks_per_scope": {
+        "description": "每个群/私聊最大并发解析数",
+        "type": "int",
+        "default": 2,
+        "slider": {
+          "min": 1,
+          "max": 10,
+          "step": 1
+        },
+        "hint": "超过限制的解析会等待，避免同时下载大量媒体拖垮机器人。"
+      },
+      "advanced_settings": {
+        "description": "显示高级资源管理设置",
+        "type": "bool",
+        "default": false
+      },
+      "cache_prune_interval_sec": {
+        "description": "缓存回收检查间隔（秒）",
+        "type": "int",
+        "default": 60,
+        "condition": {
+          "advanced_settings": true
+        },
+        "slider": {
+          "min": 10,
+          "max": 600,
+          "step": 10
+        }
+      },
+      "runtime_cache_ttl_sec": {
+        "description": "运行时缓存有效期（秒）",
+        "type": "int",
+        "default": 600,
+        "condition": {
+          "advanced_settings": true
+        },
+        "slider": {
+          "min": 30,
+          "max": 3600,
+          "step": 30
+        },
+        "hint": "用于去重记录和点歌候选缓存，过期后自动释放。"
+      }
+    }
+  },
   "trigger": {
     "description": "⚡ 自动解析与去重",
     "type": "object",
@@ -1043,6 +1283,84 @@
           "advanced_settings": true
         },
         "hint": "除非目标接口有特殊要求，否则建议保持默认值。"
+      }
+    }
+  },
+  "http_reliability": {
+    "description": "🔁 接口可靠性",
+    "type": "object",
+    "hint": "仅对网络错误、超时和服务端 5xx 进行重试；4xx 和无效 JSON 不重试。",
+    "items": {
+      "retry_count": {
+        "description": "接口重试次数",
+        "type": "int",
+        "default": 2,
+        "slider": {"min": 0, "max": 5, "step": 1}
+      },
+      "retry_backoff_ms": {
+        "description": "重试初始退避（毫秒）",
+        "type": "int",
+        "default": 500,
+        "slider": {"min": 0, "max": 5000, "step": 100}
+      },
+      "circuit_failure_threshold": {
+        "description": "熔断失败阈值",
+        "type": "int",
+        "default": 5,
+        "slider": {"min": 1, "max": 20, "step": 1}
+      },
+      "circuit_recovery_sec": {
+        "description": "熔断恢复等待（秒）",
+        "type": "int",
+        "default": 60,
+        "slider": {"min": 5, "max": 600, "step": 5}
+      }
+    }
+  },
+  "runtime_limits": {
+    "description": "🧱 资源与回退限制",
+    "type": "object",
+    "hint": "这些限制属于全局安全策略，不能被单群高级 JSON 覆盖。",
+    "items": {
+      "max_api_response_bytes": {
+        "description": "接口响应上限（字节）",
+        "type": "int",
+        "default": 5242880
+      },
+      "json_text_max_chars": {
+        "description": "JSON 文本发送长度上限",
+        "type": "int",
+        "default": 3500
+      },
+      "json_file_max_bytes": {
+        "description": "JSON 文件回退上限（字节）",
+        "type": "int",
+        "default": 2097152
+      },
+      "runtime_cache_max_entries": {
+        "description": "运行时缓存最大条目数",
+        "type": "int",
+        "default": 1000,
+        "slider": {"min": 100, "max": 10000, "step": 100}
+      }
+    }
+  },
+  "updates": {
+    "description": "⬆️ 插件更新",
+    "type": "object",
+    "hint": "更新源固定为官方仓库 jiuhunwl/astrbot_plugin_bktools；更新命令仅管理员可用。",
+    "items": {
+      "self_update_enabled": {
+        "description": "允许插件自更新",
+        "type": "bool",
+        "default": true,
+        "hint": "关闭后仍可使用 /bk版本 和 /bk检查更新，但不能执行 /bk更新插件。"
+      },
+      "max_download_mb": {
+        "description": "更新包最大体积（MB）",
+        "type": "int",
+        "default": 20,
+        "slider": {"min": 1, "max": 100, "step": 1}
       }
     }
   },
