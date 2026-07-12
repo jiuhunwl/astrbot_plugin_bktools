@@ -318,9 +318,9 @@
         "hint": "展开重试间隔、封面、原链接、展示数量和语音限制等细节设置。"
       },
       "pack_retry_count": {
-        "description": "合并转发重试次数",
+        "description": "旧版合并重试次数（已停用）",
         "type": "int",
-        "default": 2,
+        "default": 0,
         "condition": {
           "pack_forward": true,
           "advanced_settings": true
@@ -330,10 +330,10 @@
           "max": 5,
           "step": 1
         },
-        "hint": "默认重试 2 次，即首次发送加 2 次重试，最多尝试 3 次。"
+        "hint": "为避免平台已接收但接口抛错造成重复消息，v1.6.2 起不再对 send() 异常盲目重试。该字段仅为旧配置兼容保留。"
       },
       "pack_retry_delay_ms": {
-        "description": "重试间隔（毫秒）",
+        "description": "旧版重试间隔（已停用）",
         "type": "int",
         "default": 800,
         "condition": {
@@ -345,7 +345,7 @@
           "max": 5000,
           "step": 100
         },
-        "hint": "建议保持 500-1500 毫秒，过短可能连续触发平台限流。"
+        "hint": "该字段仅为旧配置兼容保留，当前版本不会执行不确定状态下的自动重试。"
       },
       "short_video_text_metadata": {
         "description": "显示作品标题、作者和文案",

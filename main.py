@@ -70,7 +70,7 @@ except ImportError:
     )
 
 
-PLUGIN_VERSION = "1.6.1"
+PLUGIN_VERSION = "1.6.2"
 
 
 def _cfg(root: Any, *keys: str, default: Any = None) -> Any:
@@ -1209,19 +1209,6 @@ class BKToolsPlugin(Star):
             self._parse_cancel_generation.get(scope, 0) + 1
         )
 
-    def _pack_retry_cfg(self) -> Tuple[int, float]:
-        msg_cfg = _cfg(self._runtime_config(), "message", default={}) or {}
-        try:
-            retry_count = int(msg_cfg.get("pack_retry_count", 2) or 0)
-        except (TypeError, ValueError):
-            retry_count = 2
-        try:
-            delay_ms = int(msg_cfg.get("pack_retry_delay_ms", 800) or 0)
-        except (TypeError, ValueError):
-            delay_ms = 800
-        # 限制重试范围，避免错误配置导致长时间阻塞或刷屏。
-        return max(0, min(retry_count, 5)), max(0, min(delay_ms, 5000)) / 1000
-
     def _runtime_limits_cfg(self) -> Dict[str, Any]:
         return _cfg(self._runtime_config(), "runtime_limits", default={}) or {}
 
@@ -1258,27 +1245,34 @@ class BKToolsPlugin(Star):
             int(limits.get("json_file_max_bytes", 2 * 1024 * 1024) or 0),
         )
         try:
-            self._runtime_manager.set_state(TaskState.SENDING)
             if len(json_text) <= text_limit:
-                await event.send(event.plain_result(json_text))
-                return True
-            if len(encoded) > file_limit:
-                raise ValueError("解析 JSON 超过文件回退大小限制")
-            if File is None:
-                raise RuntimeError("当前 AstrBot 版本不支持文件消息组件")
-            path = create_json_temp(encoded)
-            self._runtime_manager.register_temp(self._runtime_scope(), path)
-            file_node = _make_file_node(path, "bktools-result.json")
-            if file_node is None:
-                raise RuntimeError("当前平台无法构造文件消息")
-            await event.send(event.chain_result([file_node]))
-            return True
+                result = event.plain_result(json_text)
+            else:
+                if len(encoded) > file_limit:
+                    raise ValueError("解析 JSON 超过文件回退大小限制")
+                if File is None:
+                    raise RuntimeError("当前 AstrBot 版本不支持文件消息组件")
+                path = create_json_temp(encoded)
+                self._runtime_manager.register_temp(self._runtime_scope(), path)
+                file_node = _make_file_node(path, "bktools-result.json")
+                if file_node is None:
+                    raise RuntimeError("当前平台无法构造文件消息")
+                result = event.chain_result([file_node])
         except Exception as ex:
-            logger.error("%s，发送解析 JSON 失败: %s", reason, ex)
+            logger.error("%s，构造解析 JSON 消息失败: %s", reason, ex)
             try:
                 await event.send(event.plain_result("解析结果发送失败，请稍后重试或联系管理员查看诊断信息。"))
             except Exception:
                 logger.error("发送 JSON 失败提示也失败: %s", reason)
+            return False
+
+        try:
+            self._runtime_manager.set_state(TaskState.SENDING)
+            await event.send(result)
+            return True
+        except Exception as ex:
+            # send() 抛错时平台可能已经接收消息；再次发送会造成重复结果。
+            logger.warning("%s，发送结果状态不确定，为避免重复不再重试: %s", reason, ex)
             return False
 
     async def _send_packed_or_json(
@@ -1289,7 +1283,7 @@ class BKToolsPlugin(Star):
         parse_token: Tuple[str, int],
         label: str,
     ) -> bool:
-        """合并转发失败时重试；全部失败后只发送原始 JSON。"""
+        """合并转发采用至多一次发送；仅发送前的确定失败回退 JSON。"""
         send_key = self._send_key(label, raw_json)
         if not self._runtime_manager.claim_send(send_key):
             logger.info("跳过重复发送: %s", label)
@@ -1300,38 +1294,30 @@ class BKToolsPlugin(Star):
                 event, raw_json, parse_token, f"{label}无法构造合并转发"
             )
 
-        retry_count, retry_delay = self._pack_retry_cfg()
-        total_attempts = retry_count + 1
-        last_error: Optional[Exception] = None
+        if self._is_parse_cancelled(parse_token):
+            logger.info("%s发送前收到停止解析指令", label)
+            return False
+        try:
+            packed_result = event.chain_result([Nodes(forward_nodes)])
+        except Exception as ex:
+            logger.warning("%s在调用发送接口前构造失败，改为发送解析 JSON: %s", label, ex)
+            return await self._send_json_result(
+                event, raw_json, parse_token, f"{label}构造失败"
+            )
 
-        for attempt in range(1, total_attempts + 1):
-            if self._is_parse_cancelled(parse_token):
-                logger.info("%s发送前收到停止解析指令", label)
-                return False
-            try:
-                self._runtime_manager.set_state(TaskState.SENDING)
-                await event.send(event.chain_result([Nodes(forward_nodes)]))
-                return True
-            except Exception as ex:
-                last_error = ex
-                logger.warning(
-                    "%s合并转发失败（第 %d/%d 次）: %s",
-                    label,
-                    attempt,
-                    total_attempts,
-                    ex,
-                )
-                if attempt < total_attempts and retry_delay > 0:
-                    await asyncio.sleep(retry_delay)
-
-        logger.warning(
-            "%s合并转发重试全部失败，改为发送解析 JSON；最后错误: %s",
-            label,
-            last_error,
-        )
-        return await self._send_json_result(
-            event, raw_json, parse_token, f"{label}合并转发失败"
-        )
+        try:
+            self._runtime_manager.set_state(TaskState.SENDING)
+            await event.send(packed_result)
+            return True
+        except Exception as ex:
+            # AstrBot 的通用发送接口没有跨平台幂等消息 ID。异常可能发生在
+            # 平台已接收之后，因此任何自动重试或 JSON 回退都可能形成重复消息。
+            logger.warning(
+                "%s发送结果状态不确定，为避免重复打包消息，不重试也不追加 JSON: %s",
+                label,
+                ex,
+            )
+            return False
 
     def _event_scope_key(self, event: AstrMessageEvent) -> str:
         """为“搜歌后选序号”生成会话级 key，尽量按会话隔离。"""
