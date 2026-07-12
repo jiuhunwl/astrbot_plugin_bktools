@@ -6,6 +6,18 @@
 
 ## [Unreleased]
 
+## [v1.6.1] - 2026-07-12
+
+### Fixed
+
+- 修复普通 `v.douyin.com/短码` 被误判为抖音用户主页，导致短视频解析提示“未获取到作品数据”的问题
+- 抖音不透明短链现在先展开重定向，再根据最终 `/video/` 或 `/user/` 地址选择解析流程
+- 主页作品列表兼容 `data`、`data.items`、`data.works`、`data.aweme_list`、`data.videos` 等常见接口结构
+
+### Added
+
+- 新增高级配置 `short_video.profile_items_path`，自定义主页接口时可明确指定作品列表路径；留空时自动识别
+
 ## [v1.6.0] - 2026-07-11
 
 ### Added

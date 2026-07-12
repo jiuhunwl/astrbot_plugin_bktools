@@ -517,6 +517,15 @@
         },
         "hint": "标题、作者、封面等字段默认从此对象内读取。"
       },
+      "profile_items_path": {
+        "description": "主页作品列表路径",
+        "type": "string",
+        "default": "",
+        "condition": {
+          "advanced_settings": true
+        },
+        "hint": "留空时自动兼容 data、data.items、data.works、data.aweme_list 等常见结构。"
+      },
       "path_title": {
         "description": "标题字段路径",
         "type": "string",

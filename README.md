@@ -1,6 +1,13 @@
 # astrbot_plugin_bktools（BKtools）
 
-当前版本：`v1.6.0`，要求 AstrBot `v4.10.4+`，已验证兼容 AstrBot `v4.25.5`。
+当前版本：`v1.6.1`，要求 AstrBot `v4.10.4+`，已验证兼容 AstrBot `v4.25.5`。
+
+## v1.6.1 短视频路由修复
+
+- 普通 `v.douyin.com/短码` 不再被提前认作用户主页。
+- 自动解析会先展开抖音短链，最终地址为 `/video/` 时解析单作品，为 `/user/` 时解析主页作品。
+- 主页列表自动兼容 `data.items`、`data.works`、`data.aweme_list` 等常见响应结构。
+- 自定义主页接口可通过 `short_video.profile_items_path` 指定作品列表字段路径。
 
 ## v1.6.0 版本检查与安全更新
 

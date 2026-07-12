@@ -70,7 +70,7 @@ except ImportError:
     )
 
 
-PLUGIN_VERSION = "1.6.0"
+PLUGIN_VERSION = "1.6.1"
 
 
 def _cfg(root: Any, *keys: str, default: Any = None) -> Any:
@@ -779,10 +779,44 @@ def _is_douyin_profile_url(url: str) -> bool:
     host = (parsed.hostname or "").lower()
     path_lower = parsed.path.lower()
     if _host_matches(host, "v.douyin.com"):
-        if "/show/" in path_lower or "/video/" in path_lower or "/item/" in path_lower:
-            return False
-        return True
+        # v.douyin.com/xxxx 是不透明短链，既可能指向作品也可能指向主页。
+        # 在重定向展开前不能把它默认认作主页，否则普通短视频会误入主页解析。
+        return "/user/" in path_lower or "/profile/" in path_lower
     return _host_matches(host, "douyin.com") and "/user/" in path_lower
+
+
+def _profile_items_from_response(
+    payload: Dict[str, Any], configured_path: str = ""
+) -> List[Dict[str, Any]]:
+    """兼容常见主页接口列表结构，并优先尊重显式字段配置。"""
+    candidates: List[str] = []
+    configured = str(configured_path or "").strip()
+    if configured:
+        candidates.append(configured)
+    candidates.extend(
+        (
+            "data",
+            "data.items",
+            "data.works",
+            "data.aweme_list",
+            "data.videos",
+            "data.list",
+            "items",
+            "works",
+            "aweme_list",
+            "videos",
+            "list",
+        )
+    )
+    seen = set()
+    for path in candidates:
+        if path in seen:
+            continue
+        seen.add(path)
+        value = get_path(payload, path)
+        if isinstance(value, list):
+            return [item for item in value if isinstance(item, dict)]
+    return []
 
 
 @register(
@@ -1783,11 +1817,8 @@ class BKToolsPlugin(Star):
         if not _code_ok(j, cfg_sv.get("path_code") or "code", ok):
             msg = get_path(j, cfg_sv.get("path_msg") or "msg") or "接口返回失败"
             raise ValueError(str(msg))
-        path_root = (cfg_sv.get("path_data_root") or "data").strip() or "data"
-        data = get_path(j, path_root)
-        if not isinstance(data, list):
-            data = []
-        return j, list(data)
+        profile_path = str(cfg_sv.get("profile_items_path") or "").strip()
+        return j, _profile_items_from_response(j, profile_path)
 
     def _format_profile_item_text(
         self,
