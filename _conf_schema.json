@@ -455,6 +455,13 @@
         "hint": "填写完整接口地址，不要在末尾手动拼接 ?url= 参数。",
         "obvious_hint": true
       },
+      "headers": {
+        "description": "短视频解析自定义请求头",
+        "type": "dict",
+        "default": {},
+        "hint": "键值对形式附加到短视频/抖音主页解析请求，例如 {\"Authorization\": \"Bearer xxx\", \"Referer\": \"https://...\"}。同名项覆盖 http.headers 全局请求头。",
+        "editor_mode": true
+      },
       "request_method": {
         "description": "接口请求方式",
         "type": "string",
@@ -688,7 +695,7 @@
         "description": "超出数量时直接发送 JSON",
         "type": "bool",
         "default": false,
-        "hint": "JSON 会作为一条消息发送，不会拆分为单个作品或图片。"
+        "hint": "短 JSON 作为单条文本发送；长 JSON 作为一条合并转发中的文本分片发送，不会拆分为单个作品或图片，也不依赖本地临时文件。"
       },
       "image_count_threshold": {
         "description": "图集数量阈值",
@@ -734,6 +741,13 @@
         "type": "string",
         "default": "https://api.bugpk.com/api/163_music",
         "hint": "留空时自动复用搜索接口。"
+      },
+      "headers": {
+        "description": "网易云接口自定义请求头",
+        "type": "dict",
+        "default": {},
+        "hint": "键值对形式附加到网易云搜索/链接解析请求，例如 {\"Authorization\": \"Bearer xxx\"}。同名项覆盖 http.headers 全局请求头。",
+        "editor_mode": true
       },
       "advanced_settings": {
         "description": "显示高级请求与字段映射",
@@ -993,6 +1007,13 @@
         "description": "酷我音乐解析接口",
         "type": "string",
         "default": "https://api.bugpk.com/api/kuwo"
+      },
+      "headers": {
+        "description": "音乐解析自定义请求头",
+        "type": "dict",
+        "default": {},
+        "hint": "键值对形式附加到 QQ/汽水/酷我解析请求（网易云使用 netease.headers），例如 {\"Authorization\": \"Bearer xxx\"}。同名项覆盖 http.headers 全局请求头。",
+        "editor_mode": true
       },
       "advanced_settings": {
         "description": "显示高级字段映射",
@@ -1292,6 +1313,13 @@
           "advanced_settings": true
         },
         "hint": "除非目标接口有特殊要求，否则建议保持默认值。"
+      },
+      "headers": {
+        "description": "全局自定义请求头",
+        "type": "dict",
+        "default": {},
+        "hint": "键值对形式附加到所有解析接口请求，例如 {\"Authorization\": \"Bearer xxx\", \"Referer\": \"https://...\"}。各接口节（short_video/netease/link_only_music）可配置更具体的请求头覆盖同名项。",
+        "editor_mode": true
       }
     }
   },
@@ -1326,6 +1354,45 @@
       }
     }
   },
+  "send_reliability": {
+    "description": "📨 发送可靠性",
+    "type": "object",
+    "hint": "针对合并转发/JSON 等结果消息的发送失败与超时策略：连接类失败自动重试；平台响应超时（状态不确定）时不重发相同打包消息，默认不追加 JSON 兜底（平台常会延迟数分钟后送达，追加即重复），仅释放去重标记供用户手动重发。",
+    "items": {
+      "retry_max": {
+        "description": "连接类失败重试次数",
+        "type": "int",
+        "default": 2,
+        "hint": "仅对适配器未连接/断连等确定未送达的错误重试；平台已明确拒绝或响应超时均不重试相同内容。",
+        "slider": {"min": 0, "max": 5, "step": 1}
+      },
+      "retry_backoff_ms": {
+        "description": "重试退避（毫秒）",
+        "type": "int",
+        "default": 800,
+        "slider": {"min": 0, "max": 5000, "step": 100}
+      },
+      "timeout_fallback": {
+        "description": "超时兜底策略",
+        "type": "string",
+        "default": "none",
+        "hint": "none：超时后不追加兜底（推荐）。实测中平台（如 NapCat）在超时后仍会在后台继续处理大视频，约数分钟后才真正送达打包消息，追加 JSON 会与其构成重复，插件会释放去重标记并提示用户稍后重发；json：超时后立即降级发送解析 JSON（含视频直链），可马上拿到结果，但可能与迟到的打包消息重复。"
+      },
+      "timeout_grace_sec": {
+        "description": "超时后等待缓冲（秒）",
+        "type": "int",
+        "default": 5,
+        "hint": "超时后先等待该时长再发送兜底，给平台追送结果的机会，降低重复感。",
+        "slider": {"min": 0, "max": 60, "step": 1}
+      },
+      "release_claim_on_failure": {
+        "description": "发送完全失败后释放去重标记",
+        "type": "bool",
+        "default": true,
+        "hint": "开启后，打包消息与兜底 JSON 均未确认送达时释放去重标记，用户可稍后手动重发相同链接再次触发解析。"
+      }
+    }
+  },
   "runtime_limits": {
     "description": "🧱 资源与回退限制",
     "type": "object",
@@ -1342,9 +1409,23 @@
         "default": 3500
       },
       "json_file_max_bytes": {
-        "description": "JSON 文件回退上限（字节）",
+        "description": "旧版 JSON 文件上限（兼容保留）",
         "type": "int",
-        "default": 2097152
+        "default": 2097152,
+        "hint": "新配置未设置时仍作为 JSON 总输出上限使用。"
+      },
+      "json_output_max_bytes": {
+        "description": "JSON 总输出上限（字节）",
+        "type": "int",
+        "default": 2097152,
+        "hint": "超过该大小时停止发送，避免生成过大的合并消息。"
+      },
+      "json_forward_max_nodes": {
+        "description": "长 JSON 最大分片节点数",
+        "type": "int",
+        "default": 100,
+        "slider": {"min": 10, "max": 200, "step": 10},
+        "hint": "插件会自动调整每个节点的文本长度，并将所有分片放在同一条合并转发中。"
       },
       "runtime_cache_max_entries": {
         "description": "运行时缓存最大条目数",

@@ -4,7 +4,37 @@
 
 格式参考 Keep a Changelog，并遵循语义化版本管理思路。
 
-## [Unreleased]
+## [v1.6.4] - 2026-08-18
+
+### Fixed
+
+- 多平台适配（重点微信系 gewechat/wechatpadpro）：微信协议端不支持 Nodes 合并转发，会渲染为 `com.tencent.multimsg`「聊天记录」卡片（节点昵称不生效、内容被拼接为「昵称: 内容」、易被客户端限制）。现在微信平台上：作品打包/列表自动降级为逐条普通消息发送，长 JSON 自动分条普通文本发送，不再产生聊天记录卡片
+- 修复短视频/抖音主页/网易云/音乐解析失败时，将异常原文（可能包含带鉴权 key 的完整接口地址）直接发送到聊天消息导致接口 key 泄露的问题：发送给用户前统一脱敏（隐藏 URL、对 key/token/sign 等敏感 query 参数打码、截断长度），完整错误仅保留在服务端日志
+- 修复短视频解析结果发送出现 `WebSocket API call timeout` 时日志误导的问题：实测中该超时多为「延迟送达」——平台（如 NapCat）仍在后台下载/上传大视频，约数分钟后才真正发出打包卡片，并非消息丢失
+- 修复发送失败后去重标记（600 秒）阻止用户手动重发相同链接的问题：打包消息未确认送达时自动释放去重标记
+
+### Changed
+
+- 接口业务失败（如解析接口返回 429 满载）时只向用户发送友好提示（含接口 message），不把原始 JSON 发送到聊天；完整响应仅记录日志
+- 新增自定义请求头支持：`http.headers` 全局请求头（附加到所有解析接口请求），`short_video.headers` / `netease.headers` / `link_only_music.headers` 各接口节请求头（同名项覆盖全局），均以键值对形式配置，支持 Authorization/Referer/Cookie 等
+- 新增 `send_reliability` 配置节：`retry_max`（连接类失败重试次数）、`retry_backoff_ms`（重试退避）、`timeout_fallback`（超时兜底策略，默认 none）、`timeout_grace_sec`（超时后缓冲秒数）、`release_claim_on_failure`（失败后释放去重标记）
+- 超时（状态不确定）处理策略：不重发相同打包消息（避免 v1.6.2 修复的重复打包消息问题回归）；默认不追加 JSON 兜底（`timeout_fallback=none`），因为平台会延迟送达打包消息，追加 JSON 会与其构成重复；如希望超时后立即拿到结果（含视频直链），可将 `timeout_fallback` 设为 `json`（接受与迟到打包消息重复的代价）
+- 发送逻辑按异常类型分类：超时（状态不确定）与平台明确拒绝（ActionFailed 等）不重试；连接类错误（适配器断连等，确定未送达）按配置自动重试
+- 完善发送日志：区分发送成功、超时（延迟送达提示）、连接类失败重试、平台拒绝、JSON 兜底成功/失败等状态，便于排查
+
+## [v1.6.3] - 2026-07-18
+
+### Fixed
+
+- 修复大批量内容超过阈值后，将 JSON 临时文件路径 `/tmp/bktools_json_*.json` 交给独立 OneBot/NapCat 容器读取而触发 `ENOENT`、最终没有发送结果的问题
+- 长 JSON 不再依赖 AstrBot 本地临时文件，避免容器、远程适配器和主机之间路径不共享
+
+### Changed
+
+- 短 JSON 继续作为一条普通文本发送
+- 长 JSON 改为一条合并转发中的连续文本分片，内容仍为完整接口 JSON，不会逐个发送作品或图片
+- 新增 `runtime_limits.json_output_max_bytes` 和 `runtime_limits.json_forward_max_nodes`
+- 旧 `json_file_max_bytes` 配置继续作为兼容回退值
 
 ## [v1.6.2] - 2026-07-12
 

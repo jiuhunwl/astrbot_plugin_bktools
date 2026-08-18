@@ -27,10 +27,6 @@ import aiohttp
 from astrbot.api import logger
 from astrbot.api.event import filter, AstrMessageEvent
 from astrbot.api.message_components import Image, Node, Nodes, Plain, Record, Video
-try:
-    from astrbot.api.message_components import File
-except ImportError:  # AstrBot 旧版本没有 File 组件时保留文本回退
-    File = None
 from astrbot.api.star import Context, Star, register
 from astrbot.core.star.filter.event_message_type import EventMessageType
 
@@ -40,7 +36,6 @@ try:
         RuntimeManager,
         SafeHttpClient,
         TaskState,
-        create_json_temp,
     )
 except ImportError:
     from bktools_runtime import (
@@ -48,7 +43,6 @@ except ImportError:
         RuntimeManager,
         SafeHttpClient,
         TaskState,
-        create_json_temp,
     )
 try:
     from .bktools_updater import (
@@ -70,7 +64,7 @@ except ImportError:
     )
 
 
-PLUGIN_VERSION = "1.6.2"
+PLUGIN_VERSION = "1.6.4"
 
 
 def _cfg(root: Any, *keys: str, default: Any = None) -> Any:
@@ -82,6 +76,37 @@ def _cfg(root: Any, *keys: str, default: Any = None) -> Any:
             return default
         cur = cur[k]
     return cur
+
+
+# 常见接口鉴权参数名：出现在 URL query 或普通文本中时会被打码，防止接口 key 泄露
+_SENSITIVE_QUERY_KEYS = re.compile(
+    r"([\s?&](?:key|keys|token|secret|sign|signature|sig|access_key|accesskey|"
+    r"api_key|apikey|app_key|appkey|auth|authorization|cookie|password|"
+    r"passwd|pwd|credential|cred)=)[^&\s]*",
+    re.IGNORECASE,
+)
+_URL_PATTERN = re.compile(r"https?://[^\s\"'<>，。；]+", re.IGNORECASE)
+
+
+def _sanitize_user_error(err: Any, limit: int = 200) -> str:
+    """把异常/文本转换为可安全展示给用户的内容。
+
+    解析接口 endpoint 常带鉴权参数（key/token/sign 等），异常文本里若混入完整
+    接口地址会直接泄露给聊天内所有成员。这里隐藏 URL、对敏感 query 参数打码、
+    压缩空白并截断长度；完整错误仍保留在服务端日志中供排查。
+    """
+    text = str(err or "").strip()
+    if not text:
+        return "未知错误（详情见日志）"
+    if text.startswith("非 JSON 响应"):
+        # 接口返回正文可能包含敏感信息，不向用户透传原始内容
+        return "接口返回非 JSON 数据（详情见日志）"
+    text = _URL_PATTERN.sub("（接口地址已隐藏）", text)
+    text = _SENSITIVE_QUERY_KEYS.sub(r"\1***", text)
+    text = re.sub(r"\s+", " ", text).strip()
+    if len(text) > limit:
+        text = text[:limit] + "…"
+    return text or "未知错误（详情见日志）"
 
 
 def _plain_config_value(value: Any) -> Any:
@@ -299,33 +324,6 @@ def _make_video_node(url: str) -> Optional[Video]:
         return Video(file=u)
     except Exception:
         return None
-
-
-def _make_file_node(path: str, name: str):
-    if File is None:
-        return None
-    for method_name in ("fromFileSystem", "from_file", "fromPath"):
-        method = getattr(File, method_name, None)
-        if callable(method):
-            try:
-                return method(path, name=name)
-            except TypeError:
-                try:
-                    return method(path)
-                except Exception:
-                    pass
-            except Exception:
-                pass
-    for kwargs in (
-        {"file": path, "name": name},
-        {"path": path, "name": name},
-        {"file_path": path, "name": name},
-    ):
-        try:
-            return File(**kwargs)
-        except Exception:
-            continue
-    return None
 
 
 def _chain_to_forward_nodes(
@@ -1220,6 +1218,97 @@ class BKToolsPlugin(Star):
         digest = hashlib.sha256(raw.encode("utf-8")).hexdigest()
         return f"{self._runtime_scope()}:{label}:{digest}"
 
+    def _send_reliability_cfg(self) -> Dict[str, Any]:
+        return _cfg(self._runtime_config(), "send_reliability", default={}) or {}
+
+    @staticmethod
+    def _classify_send_error(ex: BaseException) -> str:
+        """把 event.send 抛出的异常分类为发送策略依据。
+
+        返回:
+          - "timeout":   平台响应超时（如 aiocqhttp 的 "WebSocket API call
+            timeout"）。请求可能已送达并在处理中，也可能已丢失 —— 状态不确定，
+            重发相同内容可能造成重复消息。
+          - "retryable": 连接层失败（适配器未连接/断连、HTTP 网络错误等），
+            消息确定未送达，重试安全且有恢复可能。
+          - "rejected":  平台明确拒绝或本地错误（ActionFailed、构造错误等），
+            消息未送达但重试通常无意义。
+        """
+        if isinstance(ex, asyncio.TimeoutError):
+            return "timeout"
+        message = str(ex or "").lower()
+        if "timeout" in message or "timed out" in message:
+            return "timeout"
+        name = type(ex).__name__.lower()
+        if (
+            "networkerror" in name
+            or "apinotavailable" in name
+            or "connection" in name
+            or "connection" in message
+            or "websocket" in message
+        ):
+            return "retryable"
+        return "rejected"
+
+    async def _dispatch_send(
+        self,
+        event: AstrMessageEvent,
+        result: Any,
+        label: str,
+        *,
+        retry_same_payload: bool,
+    ) -> str:
+        """调用 event.send 并返回发送结果分类。
+
+        - "ok":      平台已确认发送成功
+        - "timeout": 平台响应超时，状态不确定；不重发相同内容（防重复）
+        - "failed":  发送失败（确定性失败按配置重试后仍失败，或不可重试）
+        """
+        policy = self._send_reliability_cfg()
+        try:
+            retry_max = max(0, min(int(policy.get("retry_max", 2) or 0), 5))
+        except (TypeError, ValueError):
+            retry_max = 2
+        try:
+            backoff = max(
+                0.0, min(float(policy.get("retry_backoff_ms", 800) or 0) / 1000, 10.0)
+            )
+        except (TypeError, ValueError):
+            backoff = 0.8
+        attempt = 0
+        while True:
+            attempt += 1
+            try:
+                await event.send(result)
+                logger.info("%s发送成功（第 %d 次尝试）", label, attempt)
+                return "ok"
+            except asyncio.CancelledError:
+                raise
+            except Exception as ex:
+                kind = self._classify_send_error(ex)
+                if kind == "timeout":
+                    logger.warning(
+                        "%s发送超时（第 %d 次尝试），平台在适配器时限内未返回结果，"
+                        "消息是否已送达状态不确定；为避免重复，不重发相同内容。"
+                        "原始错误: %s",
+                        label, attempt, ex,
+                    )
+                    return "timeout"
+                if kind == "retryable" and retry_same_payload and attempt <= retry_max:
+                    logger.warning(
+                        "%s发送失败（连接类错误，第 %d/%d 次尝试，%s后重试）: %s",
+                        label, attempt, retry_max + 1,
+                        f"{backoff * 1000:.0f}ms" if backoff > 0 else "立即", ex,
+                    )
+                    if backoff > 0:
+                        await asyncio.sleep(backoff)
+                    continue
+                logger.warning(
+                    "%s发送失败（第 %d 次尝试后放弃，消息未送达平台）: %s",
+                    label, attempt, ex,
+                )
+                return "failed"
+
     async def _send_json_result(
         self,
         event: AstrMessageEvent,
@@ -1240,24 +1329,59 @@ class BKToolsPlugin(Star):
         encoded = json_text.encode("utf-8")
         limits = self._runtime_limits_cfg()
         text_limit = max(256, int(limits.get("json_text_max_chars", 3500) or 3500))
-        file_limit = max(
-            text_limit,
-            int(limits.get("json_file_max_bytes", 2 * 1024 * 1024) or 0),
+        configured_json_limit = limits.get(
+            "json_output_max_bytes",
+            limits.get("json_file_max_bytes", 2 * 1024 * 1024),
         )
+        json_limit = max(text_limit, int(configured_json_limit or 0))
         try:
             if len(json_text) <= text_limit:
                 result = event.plain_result(json_text)
+            elif self._is_wechat_platform(event):
+                # 微信协议端不支持 Nodes 合并转发（渲染为「聊天记录」卡片且内容
+                # 被拼接成「昵称: 内容」），长 JSON 改为分条普通文本发送。
+                if len(encoded) > json_limit:
+                    raise ValueError("解析 JSON 超过配置的输出大小限制")
+                chunk_size = max(256, min(text_limit, 1500))
+                sent_any = False
+                for index in range(0, len(json_text), chunk_size):
+                    if self._is_parse_cancelled(parse_token):
+                        logger.info("%s微信分片发送过程中收到停止指令", reason)
+                        break
+                    outcome = await self._dispatch_send(
+                        event,
+                        event.plain_result(json_text[index : index + chunk_size]),
+                        f"{reason}（JSON分片）",
+                        retry_same_payload=True,
+                    )
+                    if outcome == "ok":
+                        sent_any = True
+                if not sent_any:
+                    logger.warning("%s，微信平台 JSON 分片均未发送成功", reason)
+                return sent_any
             else:
-                if len(encoded) > file_limit:
-                    raise ValueError("解析 JSON 超过文件回退大小限制")
-                if File is None:
-                    raise RuntimeError("当前 AstrBot 版本不支持文件消息组件")
-                path = create_json_temp(encoded)
-                self._runtime_manager.register_temp(self._runtime_scope(), path)
-                file_node = _make_file_node(path, "bktools-result.json")
-                if file_node is None:
-                    raise RuntimeError("当前平台无法构造文件消息")
-                result = event.chain_result([file_node])
+                if len(encoded) > json_limit:
+                    raise ValueError("解析 JSON 超过配置的输出大小限制")
+                try:
+                    max_nodes = max(
+                        1,
+                        min(int(limits.get("json_forward_max_nodes", 100) or 100), 200),
+                    )
+                except (TypeError, ValueError):
+                    max_nodes = 100
+                # 以一条合并转发承载完整 JSON，避免本地 /tmp 文件在
+                # AstrBot 与 OneBot/NapCat 分离部署时无法跨容器读取。
+                chunk_size = max(text_limit, (len(json_text) + max_nodes - 1) // max_nodes)
+                chunks = [
+                    json_text[index : index + chunk_size]
+                    for index in range(0, len(json_text), chunk_size)
+                ]
+                name, uid = self._bot_identity(event)
+                json_nodes = [
+                    Node(name=name, uin=uid, content=[Plain(chunk)])
+                    for chunk in chunks
+                ]
+                result = event.chain_result([Nodes(json_nodes)])
         except Exception as ex:
             logger.error("%s，构造解析 JSON 消息失败: %s", reason, ex)
             try:
@@ -1266,14 +1390,48 @@ class BKToolsPlugin(Star):
                 logger.error("发送 JSON 失败提示也失败: %s", reason)
             return False
 
-        try:
-            self._runtime_manager.set_state(TaskState.SENDING)
-            await event.send(result)
+        self._runtime_manager.set_state(TaskState.SENDING)
+        outcome = await self._dispatch_send(
+            event, result, f"{reason}（JSON）", retry_same_payload=True
+        )
+        if outcome == "ok":
             return True
-        except Exception as ex:
-            # send() 抛错时平台可能已经接收消息；再次发送会造成重复结果。
-            logger.warning("%s，发送结果状态不确定，为避免重复不再重试: %s", reason, ex)
-            return False
+        # 超时/失败后不再重发相同 JSON（防重复），由上层决定是否释放去重标记。
+        logger.warning("%s，JSON 发送未确认成功（%s），不再重发", reason, outcome)
+        return False
+
+    async def _send_forward_as_plain(
+        self,
+        event: AstrMessageEvent,
+        forward_nodes: List[Node],
+        parse_token: Tuple[str, int],
+        label: str,
+    ) -> bool:
+        """微信平台降级：把合并转发节点逐条作为普通消息发送。
+
+        每个 Node 的 content 为组件列表（Plain/Image/Video 等），逐个组件独立
+        发送；任一发送失败不阻断后续节点（尽力而为），期间可响应停止指令。
+        """
+        sent_any = False
+        for node in forward_nodes:
+            if self._is_parse_cancelled(parse_token):
+                logger.info("%s微信降级发送过程中收到停止指令", label)
+                return sent_any
+            content = getattr(node, "content", None)
+            components = content if isinstance(content, list) else [node]
+            for comp in components:
+                if self._is_parse_cancelled(parse_token):
+                    logger.info("%s微信降级发送过程中收到停止指令", label)
+                    return sent_any
+                outcome = await self._dispatch_send(
+                    event,
+                    event.chain_result([comp]),
+                    f"{label}节点",
+                    retry_same_payload=True,
+                )
+                if outcome == "ok":
+                    sent_any = True
+        return sent_any
 
     async def _send_packed_or_json(
         self,
@@ -1283,7 +1441,7 @@ class BKToolsPlugin(Star):
         parse_token: Tuple[str, int],
         label: str,
     ) -> bool:
-        """合并转发采用至多一次发送；仅发送前的确定失败回退 JSON。"""
+        """合并转发至多发送一次；超时/失败时降级发送解析 JSON 兜底，保证结果不丢失。"""
         send_key = self._send_key(label, raw_json)
         if not self._runtime_manager.claim_send(send_key):
             logger.info("跳过重复发送: %s", label)
@@ -1292,6 +1450,15 @@ class BKToolsPlugin(Star):
             logger.warning("%s没有可用的合并转发节点，直接发送解析 JSON", label)
             return await self._send_json_result(
                 event, raw_json, parse_token, f"{label}无法构造合并转发"
+            )
+
+        if self._is_wechat_platform(event):
+            # 微信协议端不支持 Nodes 合并转发（会渲染为 com.tencent.multimsg
+            # 「聊天记录」卡片，节点昵称不生效、内容被拼接为「昵称: 内容」、
+            # 单条限制严格），降级为逐条普通消息发送。
+            logger.info("%s检测到微信平台，降级为逐条普通消息发送", label)
+            return await self._send_forward_as_plain(
+                event, forward_nodes, parse_token, label
             )
 
         if self._is_parse_cancelled(parse_token):
@@ -1305,19 +1472,64 @@ class BKToolsPlugin(Star):
                 event, raw_json, parse_token, f"{label}构造失败"
             )
 
-        try:
-            self._runtime_manager.set_state(TaskState.SENDING)
-            await event.send(packed_result)
+        self._runtime_manager.set_state(TaskState.SENDING)
+        outcome = await self._dispatch_send(
+            event, packed_result, label, retry_same_payload=True
+        )
+        if outcome == "ok":
             return True
-        except Exception as ex:
-            # AstrBot 的通用发送接口没有跨平台幂等消息 ID。异常可能发生在
-            # 平台已接收之后，因此任何自动重试或 JSON 回退都可能形成重复消息。
+
+        # —— 打包消息未确认送达 ——
+        # 说明：AstrBot 的通用发送接口没有跨平台幂等消息 ID。超时（timeout）
+        # 意味着平台在适配器时限（默认 180 秒）内没有返回结果，而实测中 NapCat
+        # 往往仍在后台下载/上传大视频，会在数分钟后才真正把打包消息送达——
+        # 即“延迟送达”而非“丢失”。因此：
+        #   1) 绝不重发相同的打包消息（避免 v1.6.2 修复的“三份重复打包消息”回归）；
+        #   2) 默认不追加 JSON 兜底（timeout_fallback=none），否则会与迟到的
+        #      打包消息构成重复；仅在用户显式开启 timeout_fallback=json 时才
+        #      降级发送，接受与迟到消息重复、换取立即拿到结果。
+        policy = self._send_reliability_cfg()
+        try:
+            grace = max(0, min(int(policy.get("timeout_grace_sec", 5) or 0), 120))
+        except (TypeError, ValueError):
+            grace = 5
+        fallback_mode = str(policy.get("timeout_fallback", "none") or "none").strip().lower()
+        release_on_failure = bool(policy.get("release_claim_on_failure", True))
+
+        if outcome == "timeout" and fallback_mode == "none":
+            if release_on_failure:
+                self._runtime_manager.release_send(send_key)
             logger.warning(
-                "%s发送结果状态不确定，为避免重复打包消息，不重试也不追加 JSON: %s",
+                "%s发送超时且未配置 JSON 兜底：平台可能在后台继续处理（大视频下载/"
+                "上传较慢，预计数分钟后送达），并非一定丢失；为避免与迟到送达的"
+                "打包消息重复，不再发送兜底，已释放去重标记。若长时间未收到，请"
+                "重发相同链接再次触发解析。原始错误: %s",
                 label,
-                ex,
+                outcome,
             )
             return False
+
+        if outcome == "timeout" and grace > 0:
+            logger.info("%s等待 %d 秒缓冲，给平台追送结果的机会…", label, grace)
+            await asyncio.sleep(grace)
+            if self._is_parse_cancelled(parse_token):
+                logger.info("%s缓冲等待期间收到停止解析指令，取消兜底发送", label)
+                return False
+
+        logger.warning(
+            "%s打包消息%s，降级发送解析 JSON 兜底",
+            label,
+            "超时未确认" if outcome == "timeout" else "发送失败",
+        )
+        ok = await self._send_json_result(
+            event, raw_json, parse_token,
+            f"{label}打包消息{'超时' if outcome == 'timeout' else '发送失败'}后降级",
+        )
+        if not ok and release_on_failure:
+            # 兜底也没发出去：释放去重标记，允许用户稍后手动重发相同链接
+            self._runtime_manager.release_send(send_key)
+            logger.info("%s兜底发送也未成功，已释放去重标记，用户可稍后重试", label)
+        return ok
 
     def _event_scope_key(self, event: AstrMessageEvent) -> str:
         """为“搜歌后选序号”生成会话级 key，尽量按会话隔离。"""
@@ -1391,6 +1603,24 @@ class BKToolsPlugin(Star):
             )
         )
 
+    @staticmethod
+    def _is_wechat_platform(event: AstrMessageEvent) -> bool:
+        """判断是否微信系平台（gewechat/wechatpadpro/webchat 等）。
+
+        微信协议端对 Nodes 合并转发（com.tencent.multimsg「聊天记录」卡片）支持
+        有限：节点昵称不生效、内容拼接为「昵称: 内容」、易被客户端限制。此类平台
+        应降级为普通消息逐条发送。
+        """
+        try:
+            name = (event.get_platform_name() or "").lower()
+        except Exception:
+            return False
+        if not name:
+            return False
+        if name in ("wechatpadpro", "gewechat", "webchat", "wechat", "weixin", "wx"):
+            return True
+        return any(token in name for token in ("wechat", "weixin", "gewechat", "padpro"))
+
     def _bot_identity(self, event: AstrMessageEvent) -> Tuple[str, Any]:
         name = "BKtools"
         platform = event.get_platform_name()
@@ -1430,23 +1660,59 @@ class BKToolsPlugin(Star):
         except json.JSONDecodeError as e:
             raise ValueError(f"非 JSON 响应: {text[:200]}…") from e
 
+    def _merged_request_headers(self, *sections: str) -> Dict[str, str]:
+        """合并自定义请求头：全局 http.headers + 各接口节 headers（后者覆盖前者）。
+
+        各节内配置形如 {"Authorization": "Bearer xxx", "Referer": "https://..."}。
+        """
+        merged: Dict[str, str] = {}
+        global_headers = _cfg(self._runtime_config(), "http", "headers", default={}) or {}
+        if isinstance(global_headers, dict):
+            merged.update(
+                {str(k): str(v) for k, v in global_headers.items() if v is not None}
+            )
+        for section in sections:
+            sec_headers = _cfg(self._runtime_config(), section, "headers", default={}) or {}
+            if isinstance(sec_headers, dict):
+                merged.update(
+                    {str(k): str(v) for k, v in sec_headers.items() if v is not None}
+                )
+        return merged
+
     async def _session_get_json(
-        self, session: aiohttp.ClientSession, url: str
+        self,
+        session: aiohttp.ClientSession,
+        url: str,
+        headers: Optional[Dict[str, str]] = None,
     ) -> Dict[str, Any]:
-        return await self._request_json("GET", url)
+        return await self._request_json("GET", url, headers=headers)
 
     async def _session_post_form(
-        self, session: aiohttp.ClientSession, url: str, data: Dict[str, Any]
+        self,
+        session: aiohttp.ClientSession,
+        url: str,
+        data: Dict[str, Any],
+        headers: Optional[Dict[str, str]] = None,
     ) -> Dict[str, Any]:
-        return await self._request_json("POST", url, data=data)
+        return await self._request_json("POST", url, data=data, headers=headers)
 
-    async def _request_json(self, method: str, url: str, **kwargs: Any) -> Dict[str, Any]:
+    async def _request_json(
+        self,
+        method: str,
+        url: str,
+        headers: Optional[Dict[str, str]] = None,
+        **kwargs: Any,
+    ) -> Dict[str, Any]:
         timeout_sec, ua = self._http_cfg()
         reliability = self._http_reliability_cfg()
         limits = self._runtime_limits_cfg()
+        merged_headers = self._merged_request_headers()
+        if headers:
+            merged_headers.update({str(k): str(v) for k, v in headers.items()})
         raw = await self._http_client.request_bytes(
             method,
             url,
+            headers=merged_headers or None,
             timeout_sec=timeout_sec,
             user_agent=ua,
             max_response_bytes=max(
@@ -1504,12 +1770,13 @@ class BKToolsPlugin(Star):
             raise ValueError("未配置短视频 endpoint")
         param = cfg_sv.get("url_param_name") or "url"
         method = (cfg_sv.get("request_method") or "GET").upper()
+        sv_headers = self._merged_request_headers("short_video")
         if method == "POST":
-            j = await self._request_json("POST", endpoint, data={param: link})
+            j = await self._request_json("POST", endpoint, headers=sv_headers, data={param: link})
         else:
             q = urlencode({param: link})
             sep = "&" if "?" in endpoint else "?"
-            j = await self._request_json("GET", f"{endpoint}{sep}{q}")
+            j = await self._request_json("GET", f"{endpoint}{sep}{q}", headers=sv_headers)
         path_root = (cfg_sv.get("path_data_root") or "data").strip() or "data"
         data = get_path(j, path_root)
         if not isinstance(data, dict):
@@ -1572,7 +1839,7 @@ class BKToolsPlugin(Star):
                 logger.info("短视频解析已停止，不再发送失败消息: %s", link)
                 return
             logger.warning("短视频解析失败: %s，链接: %s", e, link)
-            await event.send(event.plain_result(f"短视频解析失败：{e}"))
+            await event.send(event.plain_result(f"短视频解析失败：{_sanitize_user_error(e)}"))
             return
 
         if self._is_parse_cancelled(parse_token):
@@ -1781,10 +2048,12 @@ class BKToolsPlugin(Star):
             if self._is_parse_cancelled(parse_token):
                 logger.info("短视频非打包发送过程中收到停止指令: %s", link)
                 return
-            try:
-                await event.send(event.chain_result([comp]))
-            except Exception as ex:
-                logger.warning("发送节点失败: %s", ex)
+            await self._dispatch_send(
+                event,
+                event.chain_result([comp]),
+                "短视频解析结果节点",
+                retry_same_payload=True,
+            )
 
     async def _fetch_douyin_profile(self, profile_url: str) -> Tuple[Dict[str, Any], List[Dict[str, Any]]]:
         cfg_sv = _cfg(self._runtime_config(), "short_video", default={}) or {}
@@ -1793,12 +2062,13 @@ class BKToolsPlugin(Star):
             raise ValueError("未配置短视频 endpoint")
         param = cfg_sv.get("url_param_name") or "url"
         method = (cfg_sv.get("request_method") or "GET").upper()
+        sv_headers = self._merged_request_headers("short_video")
         if method == "POST":
-            j = await self._request_json("POST", endpoint, data={param: profile_url})
+            j = await self._request_json("POST", endpoint, headers=sv_headers, data={param: profile_url})
         else:
             q = urlencode({param: profile_url})
             sep = "&" if "?" in endpoint else "?"
-            j = await self._request_json("GET", f"{endpoint}{sep}{q}")
+            j = await self._request_json("GET", f"{endpoint}{sep}{q}", headers=sv_headers)
         ok = _parse_success_codes(str(cfg_sv.get("success_codes", "200")))
         if not _code_ok(j, cfg_sv.get("path_code") or "code", ok):
             msg = get_path(j, cfg_sv.get("path_msg") or "msg") or "接口返回失败"
@@ -1858,7 +2128,7 @@ class BKToolsPlugin(Star):
                 logger.info("抖音主页解析已停止，不再发送失败消息: %s", profile_url)
                 return
             logger.warning("抖音主页解析失败: %s，链接: %s", e, profile_url)
-            await event.send(event.plain_result(f"抖音主页解析失败：{e}"))
+            await event.send(event.plain_result(f"抖音主页解析失败：{_sanitize_user_error(e)}"))
             return
 
         if self._is_parse_cancelled(parse_token):
@@ -1929,10 +2199,12 @@ class BKToolsPlugin(Star):
             if self._is_parse_cancelled(parse_token):
                 logger.info("抖音主页非打包发送过程中收到停止指令: %s", profile_url)
                 return
-            try:
-                await event.send(event.chain_result([node]))
-            except Exception as ex:
-                logger.warning("发送节点失败: %s", ex)
+            await self._dispatch_send(
+                event,
+                event.chain_result([node]),
+                "抖音主页作品列表节点",
+                retry_same_payload=True,
+            )
 
     @_tracked_parse
     async def _netease_search(self, event: AstrMessageEvent, keyword: str) -> None:
@@ -1956,16 +2228,17 @@ class BKToolsPlugin(Star):
         if isinstance(extra, dict) and "type" not in extra and "Type" not in extra:
             extra = {"type": "search", **extra}
         params = {**extra, kparam: keyword}
+        ne_headers = self._merged_request_headers("netease")
         try:
             if method == "POST":
-                j = await self._request_json("POST", ep, data=params)
+                j = await self._request_json("POST", ep, headers=ne_headers, data=params)
             else:
                 q = urlencode(params, quote_via=quote_plus)
                 sep = "&" if "?" in ep else "?"
-                j = await self._request_json("GET", f"{ep}{sep}{q}")
+                j = await self._request_json("GET", f"{ep}{sep}{q}", headers=ne_headers)
         except Exception as e:
             logger.warning("网易云搜索失败: %s", e)
-            await event.send(event.plain_result(f"网易云搜索失败：{e}"))
+            await event.send(event.plain_result(f"网易云搜索失败：{_sanitize_user_error(e)}"))
             return
         dbg, dbg_len = self._debug_cfg()
         if dbg:
@@ -2138,14 +2411,24 @@ class BKToolsPlugin(Star):
         req_params: Dict[str, Any] = {url_key: req_link}
         if plat == "netease":
             req_params = {**netease_parse_extra, url_key: req_link}
+        # 附加自定义请求头：全局 http.headers + 对应接口节（netease 或 link_only_music）
+        api_headers = self._merged_request_headers(
+            "netease" if plat == "netease" else "link_only_music"
+        )
+        if api_headers:
+            headers = {**headers, **api_headers}
         try:
             async with aiohttp.ClientSession(timeout=to, headers=headers) as session:
                 if method == "POST":
-                    j = await self._session_post_form(session, endpoint, req_params)
+                    j = await self._session_post_form(
+                        session, endpoint, req_params, headers=api_headers
+                    )
                 else:
                     q = urlencode(req_params, quote_via=quote_plus)
                     sep = "&" if "?" in endpoint else "?"
-                    j = await self._session_get_json(session, f"{endpoint}{sep}{q}")
+                    j = await self._session_get_json(
+                        session, f"{endpoint}{sep}{q}", headers=api_headers
+                    )
 
                 # 某些 163_music 部署在 type=json 场景下对 url 参数兼容较弱：
                 # 若首轮返回成功但关键信息为空，自动回退为 ids=<song_id> 重试一次。
@@ -2161,16 +2444,20 @@ class BKToolsPlugin(Star):
                         retry_params.pop(url_key, None)
                         retry_params["ids"] = netease_song_id
                         if method == "POST":
-                            j2 = await self._session_post_form(session, endpoint, retry_params)
+                            j2 = await self._session_post_form(
+                                session, endpoint, retry_params, headers=api_headers
+                            )
                         else:
                             q2 = urlencode(retry_params, quote_via=quote_plus)
                             sep2 = "&" if "?" in endpoint else "?"
-                            j2 = await self._session_get_json(session, f"{endpoint}{sep2}{q2}")
+                            j2 = await self._session_get_json(
+                                session, f"{endpoint}{sep2}{q2}", headers=api_headers
+                            )
                         if _code_ok(j2, path_code, ok):
                             j = j2
         except Exception as e:
             logger.warning("音乐解析失败: %s", e)
-            await event.send(event.plain_result(f"音乐解析失败：{e}"))
+            await event.send(event.plain_result(f"音乐解析失败：{_sanitize_user_error(e)}"))
             return
 
         dbg, dbg_len = self._debug_cfg()
