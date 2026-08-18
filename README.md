@@ -1,6 +1,22 @@
 # astrbot_plugin_bktools（BKtools）
 
-当前版本：`v1.6.2`，要求 AstrBot `v4.10.4+`，已验证兼容 AstrBot `v4.25.5`。
+当前版本：`v1.6.4`，要求 AstrBot `v4.10.4+`，已验证兼容 AstrBot `v4.25.5`。
+
+## v1.6.4 多平台适配与发送可靠性
+
+- 微信系平台（gewechat/wechatpadpro 等）不再发送合并转发（避免渲染为「聊天记录」卡片）：作品打包降级为逐条普通消息，长 JSON 自动分条文本发送。
+- 解析接口业务失败（如 429 满载）只发送友好提示，不再把原始 JSON（可能含接口信息）发到聊天。
+- 新增自定义请求头：`http.headers` 全局 + `short_video/netease/link_only_music.headers` 接口级覆盖。
+- 新增 `send_reliability` 配置：发送超时/失败策略（连接类错误重试、超时延迟送达提示、失败后释放去重标记）。
+- 解析失败的错误消息统一脱敏，接口 key/URL 不再泄露到聊天。
+
+## v1.6.3 大批量 JSON 发送修复
+
+- 修复 AstrBot 与 OneBot/NapCat 分离部署时，适配器无法读取 AstrBot 容器 `/tmp/bktools_json_*.json` 而返回 `ENOENT` 的问题。
+- 超过图集或实况阈值后，短 JSON 仍发送单条文本；长 JSON 改为一条合并转发中的连续文本分片。
+- 不再使用本地临时 JSON 文件，因此不要求 AstrBot 与消息适配器共享文件系统。
+- JSON 仍保持完整接口响应，不会降级为逐个作品或逐张图片发送。
+- 新增 JSON 总输出大小与最大分片节点数配置。
 
 ## v1.6.2 合并消息重复发送修复
 
