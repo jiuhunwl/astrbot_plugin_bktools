@@ -32,20 +32,32 @@ from astrbot.core.star.filter.event_message_type import EventMessageType
 
 
 def _patch_astrbot_dict_config_preservation() -> None:
-    """修复 AstrBot 框架缺陷：dict 类型配置项（自由键值对）在完整性检查时被清空。
+    """修复 AstrBot 框架缺陷：dict 类型配置项（自由键值对）无法保存/被清空。
 
-    AstrBot 的 AstrBotConfig.check_config_integrity() 会把 schema 中默认值为空 dict
-    的配置项（如 short_video.headers / http.headers 等 "type": "dict" 项）当作
-    “子配置”递归白名单清理：用户添加的键不在参考配置中，判定为“多余键”被丢弃，
-    同时 has_new=True 触发立即写回，导致用户保存的请求头在插件热重载后永久丢失。
-
-    本补丁与官方修复 PR（AstrBotDevs/AstrBot#9516，修复 issue #9512）等价：
-    参考值为空 dict 时直接保留用户全部键值对，不再递归清理。
-    非空参考值（object 子配置）行为保持不变。补丁幂等、可安全重复加载。
+    两个独立缺陷：
+    1. 老版本（如 v4.25.5）的 DEFAULT_VALUE_MAP 不含 "dict" 类型，
+       _config_schema_to_default_config() 遇到 schema 中 "type": "dict" 会直接抛
+       TypeError（"不受支持的配置类型 dict"），导致插件配置无法初始化，WebUI
+       里保存请求头不生效。补丁向 DEFAULT_VALUE_MAP 原地注入 "dict": {}（与原
+       dict 对象同一引用，老代码处立即生效），master 及后续版本本身已支持，
+       补丁幂等无害。
+    2. AstrBotConfig.check_config_integrity() 会把 schema 中默认值为空 dict 的
+       配置项（如 short_video.headers / http.headers 等 "type": "dict" 项）当作
+       “子配置”递归白名单清理：用户添加的键不在参考配置中，判定为“多余键”被
+       丢弃，同时 has_new=True 触发立即写回，导致用户保存的请求头在插件热
+       重载后永久丢失。补丁与官方修复 PR（AstrBotDevs/AstrBot#9516，修复
+       issue #9512）等价：参考值为空 dict 时直接保留用户全部键值对，不再递归
+       清理；非空参考值（object 子配置）行为保持不变。补丁幂等、可安全重复加载。
     """
 
     try:
+        from astrbot.core.config import default as _cfg_default
         from astrbot.core.config.astrbot_config import AstrBotConfig
+
+        # 缺陷 1：老版本 DEFAULT_VALUE_MAP 不识别 dict 类型（原地注入，幂等）
+        if "dict" not in _cfg_default.DEFAULT_VALUE_MAP:
+            _cfg_default.DEFAULT_VALUE_MAP["dict"] = {}
+            logger.info("[bktools] 已为 DEFAULT_VALUE_MAP 注入 dict 类型支持")
 
         if getattr(AstrBotConfig, "_bktools_dict_preservation_patched", False):
             return
@@ -96,13 +108,13 @@ def _patch_astrbot_dict_config_preservation() -> None:
         AstrBotConfig.check_config_integrity = _check_config_integrity
         AstrBotConfig._bktools_dict_preservation_patched = True
         logger.info(
-            "[bktools] 已应用 dict 类型配置保留补丁（AstrBotDevs/AstrBot#9512 等价修复）"
+            "[bktools] 已应用 dict 类型配置补丁（DEFAULT_VALUE_MAP 注入 + 完整性保留，AstrBotDevs/AstrBot#9512 等价修复）"
         )
     except ImportError:
         # 框架版本差异导致无法导入时静默跳过，不影响插件主功能
-        logger.info("[bktools] AstrBotConfig 不可导入，跳过 dict 配置保留补丁")
+        logger.info("[bktools] AstrBotConfig 不可导入，跳过 dict 类型配置补丁")
     except Exception as exc:  # pragma: no cover - 防御性兜底
-        logger.info("[bktools] dict 配置保留补丁应用失败: %s", exc)
+        logger.info("[bktools] dict 类型配置补丁应用失败: %s", exc)
 
 
 _patch_astrbot_dict_config_preservation()

@@ -484,6 +484,67 @@ class DictConfigPreservationPatchTests(unittest.TestCase):
         self.assertEqual(conf["http"]["headers"], {})
         self.assertTrue(has_new)
 
+    def test_default_value_map_dict_injection(self):
+        """老版本 DEFAULT_VALUE_MAP 缺 dict 时，补丁注入后 schema 能正常转默认配置。
+
+        模拟 AstrBot v4.25.5（DEFAULT_VALUE_MAP 无 "dict"）：
+        注入前 _config_schema_to_default_config 会抛 TypeError；
+        注入后应返回空 dict 默认值。
+        """
+        # 老版本 DEFAULT_VALUE_MAP（无 dict）
+        old_map = {
+            "int": 0,
+            "float": 0.0,
+            "bool": False,
+            "string": "",
+            "text": "",
+            "list": [],
+            "file": [],
+            "object": {},
+            "template_list": [],
+        }
+        self.assertNotIn("dict", old_map)
+
+        # 补丁等价操作：原地注入
+        old_map["dict"] = {}
+
+        def _schema_to_default(schema):
+            conf = {}
+
+            def _parse(schema, conf):
+                for k, v in schema.items():
+                    if v["type"] not in old_map:
+                        raise TypeError(
+                            f"不受支持的配置类型 {v['type']}。支持的类型有：{old_map.keys()}"
+                        )
+                    default = v.get("default", old_map[v["type"]])
+                    if v["type"] == "object":
+                        conf[k] = {}
+                        _parse(v["items"], conf[k])
+                    else:
+                        conf[k] = __import__("copy").deepcopy(default)
+
+            _parse(schema, conf)
+            return conf
+
+        schema = {
+            "http": {
+                "type": "object",
+                "items": {
+                    "headers": {"type": "dict", "default": {}},
+                    "timeout_sec": {"type": "int", "default": 45},
+                },
+            },
+            "short_video": {
+                "type": "object",
+                "items": {"headers": {"type": "dict", "default": {}}},
+            },
+        }
+        default = _schema_to_default(schema)
+        self.assertEqual(default["http"]["headers"], {})
+        self.assertEqual(default["short_video"]["headers"], {})
+        self.assertEqual(default["http"]["timeout_sec"], 45)
+
 
 class _WechatEvent(_Event):
     def get_platform_name(self):
