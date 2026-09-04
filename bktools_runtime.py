@@ -72,8 +72,12 @@ def _trim_server_error(text: str, limit: int = 300) -> str:
                     nested = _trim_server_error(json.dumps(value, ensure_ascii=False), limit)
                     if nested:
                         return nested
-                elif value is not None:
-                    return _trim_server_error(str(value), limit)
+                elif isinstance(value, (int, float, bool)):
+                    # 数字/布尔可以转字符串透传，但 0 / False 视为无意义跳过
+                    text_form = str(value)
+                    if text_form.strip() and text_form not in ("0", "False"):
+                        return _trim_server_error(text_form, limit)
+                # 空字符串 / None / 空 list / 空 dict 都跳过，继续尝试下一个字段
             # 无业务字段时保留原始 JSON，但压缩空白
             text = json.dumps(payload, ensure_ascii=False, separators=(",", ":"))
     text = _HTML_TAG_RE.sub(" ", text)

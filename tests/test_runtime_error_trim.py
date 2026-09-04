@@ -64,6 +64,23 @@ class TrimServerErrorTests(unittest.TestCase):
         raw = b"\xff\xfe\x01".decode("utf-8", errors="replace")
         self.assertIsInstance(rt._trim_server_error(raw), str)
 
+    def test_empty_msg_fallback_to_message(self):
+        """msg 字段为空时应继续向后查找，回退到 message 字段（回归 bug）。"""
+        body = '{"msg": "", "message": "只有message有效"}'
+        self.assertEqual(rt._trim_server_error(body), "只有message有效")
+
+    def test_all_known_fields_empty_fallback_to_raw(self):
+        """所有已知字段都为空字符串时，回退到原始 JSON 文本。"""
+        body = '{"msg": "", "message": "", "error": ""}'
+        result = rt._trim_server_error(body)
+        self.assertTrue(result)  # 不应为空
+        self.assertIn("msg", result)
+
+    def test_int_error_code_passthrough(self):
+        """业务字段值为整数错误码时也应能透传（如 error: 502）。"""
+        body = '{"msg": "", "message": "", "error": 502}'
+        self.assertEqual(rt._trim_server_error(body), "502")
+
 
 if __name__ == "__main__":
     unittest.main()
