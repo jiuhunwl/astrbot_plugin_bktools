@@ -1,7 +1,9 @@
 from __future__ import annotations
 
 import asyncio
+import json
 import os
+import re
 import tempfile
 import time
 from dataclasses import dataclass
@@ -39,6 +41,46 @@ class CircuitState:
 
 class CircuitOpenError(RuntimeError):
     pass
+
+
+# 上游 5xx 响应体中常见的业务错误字段，用于透传真实错误信息
+_SERVER_ERROR_MSG_FIELDS = (
+    "msg", "message", "error", "error_msg", "errmsg", "detail", "info", "reason",
+)
+_HTML_TAG_RE = re.compile(r"<[^>]+>")
+
+
+def _trim_server_error(text: str, limit: int = 300) -> str:
+    """提取并精简上游错误正文，供透传给用户/日志。"""
+    text = (text or "").strip()
+    if not text:
+        return ""
+    try:
+        payload = json.loads(text)
+    except (json.JSONDecodeError, TypeError):
+        pass
+    else:
+        # 优先取业务字段，避免把整段响应原文透传
+        if isinstance(payload, dict):
+            for key in _SERVER_ERROR_MSG_FIELDS:
+                value = payload.get(key) or payload.get(key.lower())
+                if isinstance(value, list):
+                    value = value[0] if value else ""
+                if isinstance(value, str) and value.strip():
+                    return _trim_server_error(value, limit)
+                if isinstance(value, dict):
+                    nested = _trim_server_error(json.dumps(value, ensure_ascii=False), limit)
+                    if nested:
+                        return nested
+                elif value is not None:
+                    return _trim_server_error(str(value), limit)
+            # 无业务字段时保留原始 JSON，但压缩空白
+            text = json.dumps(payload, ensure_ascii=False, separators=(",", ":"))
+    text = _HTML_TAG_RE.sub(" ", text)
+    text = re.sub(r"\s+", " ", text).strip()
+    if len(text) > limit:
+        text = text[:limit] + "…"
+    return text
 
 
 class RuntimeManager:
@@ -206,11 +248,19 @@ class SafeHttpClient:
                 session = await self.get_session(timeout_sec, user_agent)
                 async with session.request(method, url, **kwargs) as response:
                     if response.status >= 500:
+                        # 尽力读取上游错误正文并提取 msg，透传真实原因
+                        upstream = ""
+                        try:
+                            body = await response.content.read(64 * 1024)
+                            upstream = _trim_server_error(body.decode("utf-8", errors="replace"))
+                        except Exception:
+                            pass
+                        detail = f" (upstream: {upstream})" if upstream else ""
                         raise aiohttp.ClientResponseError(
                             response.request_info,
                             response.history,
                             status=response.status,
-                            message="upstream server error",
+                            message=f"upstream server error{detail}",
                             headers=response.headers,
                         )
                     response.raise_for_status()
