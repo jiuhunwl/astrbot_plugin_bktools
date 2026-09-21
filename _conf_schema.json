@@ -414,6 +414,15 @@
         },
         "hint": "同时用于抖音主页作品列表和网易云搜索结果。"
       },
+      "shorten_music_link": {
+        "description": "音乐直链过长时截断显示",
+        "type": "bool",
+        "default": true,
+        "condition": {
+          "advanced_settings": true
+        },
+        "hint": "开启后卡片中的音频/歌词直链超过 96 字符会以“…”截断，避免刷屏；完整地址仍用于语音发送与下载。关闭则始终展示完整链接。"
+      },
       "send_voice_message": {
         "description": "音乐解析后发送语音消息",
         "type": "bool",

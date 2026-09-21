@@ -365,6 +365,132 @@ class BatchOutputTests(unittest.IsolatedAsyncioTestCase):
         self.assertNotIn("502", text)
 
 
+class MusicMetaTests(unittest.TestCase):
+    """音乐字段清洗：占位符过滤、多路径兜底与可读化转换。"""
+
+    def test_placeholder_values_filtered(self):
+        for bad in ("未知艺术家", "未知歌手", "未知", "unknown", "Unknown Artist", "-", "—", "n/a", "none"):
+            self.assertEqual(bk._clean_meta(bad), "", bad)
+        self.assertEqual(bk._clean_meta(None), "")
+        self.assertEqual(bk._clean_meta("   "), "")
+        self.assertEqual(bk._clean_meta("周杰伦"), "周杰伦")
+        self.assertEqual(bk._clean_meta(0), "0")
+
+    def test_first_meta_skips_empty_and_placeholder(self):
+        data = {"albumname": "", "artistsname": "未知艺术家", "name": "夜曲"}
+        self.assertEqual(bk._first_meta(data, ("albumname", "name"), {}), "夜曲")
+        self.assertEqual(
+            bk._first_meta(data, ("artistsname", "artist", "author"), {}), ""
+        )
+
+    def test_paths_fall_back_when_configured_path_missing(self):
+        # 上游改了字段名：配置的 albumname/artistsname 缺失，仍需兜底到 title/artist
+        data = {"title": "来自天堂的魔鬼", "artist": "Zxxy", "url": "https://x/a.m4a"}
+        fields = bk._extract_music_fields(
+            data, {}, title_p="albumname", author_p="artistsname", audio_p="url"
+        )
+        self.assertEqual(fields["title"], "来自天堂的魔鬼")
+        self.assertEqual(fields["author"], "Zxxy")
+        self.assertEqual(fields["audio"], "https://x/a.m4a")
+
+    def test_size_and_bitrate_readable(self):
+        self.assertEqual(bk._format_audio_size(487203), "475.78KB")
+        self.assertEqual(bk._format_audio_size("26.86 MB"), "26.86 MB")
+        self.assertEqual(bk._format_audio_size(""), "")
+        self.assertEqual(bk._format_bitrate(129916), "130kbps")
+        self.assertEqual(bk._format_bitrate(1119746), "1.12Mbps")
+        self.assertEqual(bk._format_bitrate(None), "")
+
+    def test_quality_label_mapping(self):
+        self.assertEqual(bk._format_music_quality("higher"), "较高")
+        self.assertEqual(bk._format_music_quality("lossless"), "无损")
+        self.assertEqual(bk._format_music_quality("未知"), "")
+        self.assertEqual(bk._format_music_quality("96k"), "96k")
+
+
+class MusicCardTests(unittest.TestCase):
+    """音乐卡片渲染：平台名、字段顺序与长链接截断。"""
+
+    QISHUI = {
+        "url": "https://v11-luna.douyinvod.com/" + "a" * 400,
+        "video_meta": {
+            "quality": "higher",
+            "vtype": "m4a",
+            "codec_type": "aac",
+            "bitrate": 129916,
+            "size": 487203,
+        },
+        "albumname": "来自天堂的魔鬼",
+        "artistsname": "Zxxy（加勒比Music）",
+        "artistsmedium_avatar_url": ["https://p3.douyinpic.com/avatar.jpeg"],
+    }
+
+    def _fields(self, data, **kw):
+        kw.setdefault("title_p", "albumname")
+        kw.setdefault("author_p", "artistsname")
+        kw.setdefault("audio_p", "url")
+        return bk._extract_music_fields(data, {"data": data}, **kw)
+
+    def test_platform_label_is_chinese(self):
+        card = bk._format_music_card("qishui", self._fields(self.QISHUI))
+        self.assertTrue(card.startswith("平台：汽水音乐\n"))
+        self.assertNotIn("qishui", card)
+        self.assertIn("平台：QQ音乐", bk._format_music_card("qq", self._fields(self.QISHUI)))
+        self.assertIn("平台：酷我音乐", bk._format_music_card("kuwo", self._fields(self.QISHUI)))
+        self.assertIn("平台：网易云音乐", bk._format_music_card("netease", self._fields(self.QISHUI)))
+
+    def test_qishui_card_reads_video_meta(self):
+        card = bk._format_music_card("qishui", self._fields(self.QISHUI))
+        self.assertIn("曲名：来自天堂的魔鬼", card)
+        self.assertIn("艺人：Zxxy（加勒比Music）", card)
+        self.assertIn("大小：475.78KB", card)
+        self.assertIn("音质：M4A · 较高 · 130kbps", card)
+
+    def test_unknown_artist_line_omitted(self):
+        data = dict(self.QISHUI, artistsname="未知艺术家")
+        card = bk._format_music_card("qishui", self._fields(data))
+        self.assertNotIn("未知艺术家", card)
+        self.assertNotIn("艺人：", card)
+
+    def test_audio_url_shortened_by_default(self):
+        card = bk._format_music_card("qishui", self._fields(self.QISHUI))
+        audio_line = [ln for ln in card.splitlines() if ln.startswith("音频：")][0]
+        self.assertTrue(audio_line.endswith("…"))
+        self.assertLess(len(audio_line), 140)
+
+    def test_audio_url_kept_when_shortening_disabled(self):
+        card = bk._format_music_card("qishui", self._fields(self.QISHUI), display_limit=0)
+        audio_line = [ln for ln in card.splitlines() if ln.startswith("音频：")][0]
+        self.assertEqual(audio_line, "音频：" + self.QISHUI["url"])
+
+    def test_missing_title_renders_dash(self):
+        card = bk._format_music_card("qishui", self._fields({"url": "https://x/a.mp3"}))
+        self.assertIn("曲名：—", card)
+
+    def test_karaoke_lyric_is_cleaned(self):
+        data = dict(
+            self.QISHUI,
+            lyric="[1980,1990]<0,260,0>风<260,240,0>扬\n[5740,2430]<0,270,0>谁<280,240,0>执",
+        )
+        card = bk._format_music_card("qishui", self._fields(data))
+        self.assertIn("歌词预览：\n风扬\n谁执", card)
+        self.assertNotIn("<0,260,0>", card)
+        self.assertNotIn("[1980,1990]", card)
+
+    def test_lyric_preview_is_capped(self):
+        data = dict(self.QISHUI, lyric="\n".join(f"第{i}行歌词" for i in range(20)))
+        card = bk._format_music_card("qishui", self._fields(data))
+        preview = card.split("歌词预览：\n", 1)[1]
+        self.assertEqual(len(preview.splitlines()), 6)
+        self.assertTrue(preview.endswith("…"))
+
+    def test_lyric_url_rendered_as_link(self):
+        data = dict(self.QISHUI, lyric="https://x.com/lrc")
+        card = bk._format_music_card("qishui", self._fields(data))
+        self.assertIn("歌词链接：https://x.com/lrc", card)
+        self.assertNotIn("歌词预览", card)
+
+
 def _async(value):
     async def _coro():
         return value

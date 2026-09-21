@@ -19,7 +19,7 @@ from contextlib import asynccontextmanager, contextmanager
 from contextvars import ContextVar
 from datetime import datetime, timedelta, timezone
 from functools import wraps
-from collections.abc import Mapping
+from collections.abc import Iterable, Mapping
 from typing import Any, Dict, List, Optional, Tuple
 from urllib.parse import quote, quote_plus, urlencode, urljoin, urlparse
 
@@ -153,7 +153,7 @@ except ImportError:
     )
 
 
-PLUGIN_VERSION = "1.6.5"
+PLUGIN_VERSION = "1.6.6"
 
 
 def _cfg(root: Any, *keys: str, default: Any = None) -> Any:
@@ -213,6 +213,198 @@ _SIZE_UNITS = ("B", "KB", "MB", "GB", "TB", "PB")
 _RESOURCE_TYPE_LABELS = {"video": "视频", "image": "图集", "live": "实况"}
 # 统一契约里可能承载标签的字段路径（按优先级）
 _TAG_PATHS = ("extra.tags", "tags", "extra.tag_list", "tag_list", "extra.topics")
+
+# ── 音乐卡片字段规范化 ────────────────────────────────────────────────────
+# 音乐平台内部标识 → 展示名（未知标识保留原值，避免出现 "平台：qishui" 这类内部代号）
+_MUSIC_PLATFORM_LABELS = {
+    "netease": "网易云音乐",
+    "qq": "QQ音乐",
+    "qishui": "汽水音乐",
+    "kuwo": "酷我音乐",
+}
+# 上游常见的"未知"占位符：与真正缺失等价，不应原样展示给用户
+# （汽水音乐部分原声/无版权曲目会返回 artistsname = "未知艺术家"）
+_META_PLACEHOLDERS = frozenset(
+    {
+        "未知", "未知艺术家", "未知歌手", "未知歌曲", "未知作者", "未知名称",
+        "未知专辑", "暂无", "无", "none", "null", "nil", "n/a", "na",
+        "unknown", "unknown artist", "-", "--", "—", "－",
+    }
+)
+# 音质等级英文 → 中文（未收录的值原样保留）
+_MUSIC_QUALITY_LABELS = {
+    "standard": "标准", "low": "低", "medium": "中", "high": "高",
+    "higher": "较高", "highest": "极高", "exhigh": "极高", "lossless": "无损",
+    "hires": "Hi-Res", "sq": "无损", "hq": "高",
+}
+
+
+def _clean_meta(value: Any) -> str:
+    """清洗上游元数据：None / 空白 / 占位符统一视为无内容。"""
+    if value is None or isinstance(value, bool):
+        return ""
+    if isinstance(value, (int, float)):
+        return str(value)
+    text = str(value).strip()
+    if not text or text.lower() in _META_PLACEHOLDERS:
+        return ""
+    return text
+
+
+def _first_meta(data: Any, paths: Iterable[Any], json_root: Any) -> str:
+    """按候选路径顺序取第一个有效值（跳过空值与"未知"占位符）。"""
+    for path in paths:
+        if not path:
+            continue
+        value = _clean_meta(_rel_data(data, str(path), json_root))
+        if value:
+            return value
+    return ""
+
+
+def _format_audio_size(value: Any) -> str:
+    """音频大小：纯数字按 1024 进制换算；已是 "26.86 MB" 之类的文本原样保留。"""
+    text = _clean_meta(value)
+    if not text:
+        return ""
+    if re.fullmatch(r"\d+(?:\.\d+)?", text):
+        return _format_size_label(text)
+    return text
+
+
+def _format_bitrate(value: Any) -> str:
+    """码率：bps → kbps / Mbps 可读文本。"""
+    text = _clean_meta(value)
+    if not text:
+        return ""
+    try:
+        bps = float(text)
+    except (TypeError, ValueError):
+        return ""
+    if not bps > 0:
+        return ""
+    if bps >= 1_000_000:
+        return f"{bps / 1_000_000:.2f}".rstrip("0").rstrip(".") + "Mbps"
+    return f"{bps / 1000:.0f}kbps"
+
+
+def _format_music_quality(value: Any) -> str:
+    """音质等级：命中映射表返回中文，否则原样返回。"""
+    text = _clean_meta(value)
+    if not text:
+        return ""
+    return _MUSIC_QUALITY_LABELS.get(text.lower(), text)
+
+
+def _is_http_url(text: Any) -> bool:
+    return str(text or "").strip().lower().startswith(("http://", "https://"))
+
+
+# LRC 时间轴 [01:20.30]、汽水音乐逐字标签 <0,260,0> 与 [1980,1990] 行首时间轴
+_LRC_TIMESTAMP_RE = re.compile(r"\[\d{1,3}:\d{1,2}(?:[.:]\d{1,3})?\]|\[\d+,\d+(?:,\d+)*\]")
+_KARAOKE_TAG_RE = re.compile(r"<\d+(?:,\d+){1,3}>")
+
+
+def _clean_lyric_preview(lyric: Any, *, max_lines: int = 6, max_chars: int = 300) -> str:
+    """把 LRC / 逐字歌词转为可读纯文本预览（去掉时间轴与卡拉OK标签）。"""
+    text = str(lyric or "").strip()
+    if not text:
+        return ""
+    candidates: List[str] = []
+    for raw in text.splitlines() or [text]:
+        line = _KARAOKE_TAG_RE.sub("", _LRC_TIMESTAMP_RE.sub("", raw)).strip()
+        if line:
+            candidates.append(line)
+    if not candidates:
+        candidates = [text]
+    truncated = len(candidates) > max_lines
+    preview = "\n".join(candidates[:max_lines])
+    if len(preview) > max_chars:
+        return preview[:max_chars] + "…"
+    return preview + "…" if truncated else preview
+
+
+def _shorten_for_display(text: Any, limit: int = 96) -> str:
+    """长直链的展示截断（仅影响卡片文本，完整地址仍用于实际播放/下载请求）。"""
+    if limit <= 0:
+        return str(text or "").strip()
+    s = str(text or "").strip()
+    if len(s) <= limit:
+        return s
+    return s[: max(1, limit - 1)] + "…"
+
+
+def _extract_music_fields(
+    data: Any,
+    json_root: Any,
+    *,
+    title_p: str = "",
+    author_p: str = "",
+    cover_p: str = "",
+    audio_p: str = "",
+    lyric_p: str = "",
+    album_p: str = "",
+    size_p: str = "",
+    level_p: str = "",
+) -> Dict[str, str]:
+    """按统一契约抽取音乐字段：多路径兜底 + 占位符过滤 + 可读化转换。
+
+    配置的字段路径优先，其后跟随各平台常见字段名兜底，避免上游改字段后
+    卡片直接变成 `曲名：—`。
+    """
+    return {
+        "title": _first_meta(
+            data, (title_p, "albumname", "title", "name", "songname", "song_name"), json_root
+        ),
+        "author": _first_meta(
+            data,
+            (author_p, "artistsname", "artist_name", "artist", "author", "ar_name", "singers"),
+            json_root,
+        ),
+        "cover": _first_meta(
+            data, (cover_p, "artistsmedium_avatar_url.0", "cover", "pic", "cover_url"), json_root
+        ),
+        "audio": _first_meta(data, (audio_p, "url", "download_url", "music_url"), json_root),
+        "lyric": _first_meta(data, (lyric_p, "lyric"), json_root),
+        "album": _first_meta(data, (album_p, "albumname", "album", "al_name"), json_root),
+        "size": _format_audio_size(
+            _first_meta(data, (size_p, "Size", "size", "video_meta.size"), json_root)
+        ),
+        "format": _first_meta(
+            data, ("Format", "format", "video_meta.vtype", "video_meta.codec_type", "Codec"), json_root
+        ).upper(),
+        "level": _format_music_quality(
+            _first_meta(data, (level_p, "video_meta.quality", "quality"), json_root)
+        ),
+        "bitrate": _format_bitrate(
+            _first_meta(data, ("Bitrate", "bitrate", "video_meta.bitrate"), json_root)
+        ),
+    }
+
+
+def _format_music_card(plat: str, fields: Mapping[str, str], *, display_limit: int = 96) -> str:
+    """渲染音乐解析卡片：平台名中文化，空字段按契约省略对应行。"""
+    lines = [f"平台：{_MUSIC_PLATFORM_LABELS.get(plat, plat)}"]
+    lines.append(f"曲名：{fields['title']}" if fields.get("title") else "曲名：—")
+    if fields.get("author"):
+        lines.append(f"艺人：{fields['author']}")
+    if fields.get("album"):
+        lines.append(f"专辑：{fields['album']}")
+    if fields.get("size"):
+        lines.append(f"大小：{fields['size']}")
+    quality_bits = [fields[k] for k in ("format", "level", "bitrate") if fields.get(k)]
+    if quality_bits:
+        lines.append("音质：" + " · ".join(quality_bits))
+    lines.append(f"音频：{_shorten_for_display(fields.get('audio'), display_limit)}")
+    lyric = str(fields.get("lyric") or "")
+    if lyric:
+        if _is_http_url(lyric):
+            lines.append(f"歌词链接：{_shorten_for_display(lyric, display_limit)}")
+        else:
+            preview = _clean_lyric_preview(lyric)
+            if preview:
+                lines.append("歌词预览：\n" + preview)
+    return "\n".join(lines)
 
 
 def _format_size_label(size: Any) -> str:
@@ -2992,58 +3184,83 @@ class BKToolsPlugin(Star):
             if isinstance(j, dict) and any(k in j for k in ("name", "url", "ar_name", "al_name", "pic")):
                 data = j
 
-        title = _rel_data(data, title_p, j) or ""
-        author = _rel_data(data, author_p, j) or ""
-        cover = _rel_data(data, cover_p, j) or ""
-        audio = _rel_data(data, audio_p, j) or ""
-        lyric = _rel_data(data, lyric_p, j) if lyric_p else ""
-        album = _rel_data(data, album_p, j) if album_p else ""
-        size_v = _rel_data(data, size_p, j) if size_p else ""
-        level_v = _rel_data(data, level_p, j) if level_p else ""
+        msg_cfg = _cfg(self._runtime_config(), "message", default={}) or {}
+
+        # 字段缺失/占位符不展示，并按候选路径兜底，避免出现
+        # “曲名：—”与“艺人：未知艺术家”（汽水音乐原声/无版权曲目）这类上游噪声。
+        mf = _extract_music_fields(
+            data,
+            j,
+            title_p=title_p,
+            author_p=author_p,
+            cover_p=cover_p,
+            audio_p=audio_p,
+            lyric_p=lyric_p,
+            album_p=album_p,
+            size_p=size_p,
+            level_p=level_p,
+        )
+        title = mf["title"]
+        author = mf["author"]
+        cover = mf["cover"]
+        audio = mf["audio"]
 
         if dbg:
             try:
                 logger.info(
-                    "[BKtools][debug] netease.parse data: title=%r, audio=%r, album=%r, size=%r, level=%r, raw_data=%s",
+                    "[BKtools][debug] 音乐解析(%s) data: title=%r, author=%r, audio=%r, album=%r, size=%r, format=%r, level=%r, bitrate=%r, raw_data=%s",
+                    plat,
                     title,
+                    author,
                     audio,
-                    album,
-                    size_v,
-                    level_v,
+                    mf["album"],
+                    mf["size"],
+                    mf["format"],
+                    mf["level"],
+                    mf["bitrate"],
                     str(data)[:dbg_len],
                 )
             except Exception:
                 pass
 
-        lines = [
-            f"平台：{plat}",
-            f"曲名：{title}" if title else "曲名：—",
-            f"艺人：{author}" if author else "",
-        ]
-        if album:
-            lines.append(f"专辑：{album}")
-        if level_v:
-            lines.append(f"音质：{level_v}")
-        if size_v:
-            lines.append(f"大小：{size_v}")
-        lines.append(f"音频：{audio}" if audio else "音频：—")
-        if lyric:
-            preview = str(lyric)[:800]
-            if len(str(lyric)) > 800:
-                preview += "…"
-            lines.append("歌词预览：\n" + preview)
-        text = "\n".join(x for x in lines if x)
-        msg_cfg = _cfg(self._runtime_config(), "message", default={}) or {}
+        # 标题/艺人为空时留一条诊断日志（不含凭据），便于定位上游字段变动
+        if not title or not author:
+            try:
+                data_keys = (
+                    sorted(data.keys())[:20] if isinstance(data, dict) else type(data).__name__
+                )
+            except Exception:
+                data_keys = "?"
+            logger.info(
+                "[BKtools] 音乐解析字段缺失（平台=%s，缺失=%s，data_keys=%s）",
+                plat,
+                ",".join(n for n, v in (("title", title), ("author", author)) if not v) or "-",
+                data_keys,
+            )
+
+        # 没有音频直链时整条结果不可用，给出友好提示而不是一张空卡片
+        if not audio:
+            logger.warning("音乐解析未返回音频直链（平台=%s，链接=%s）", plat, req_link)
+            await event.send(
+                event.plain_result(
+                    "音乐解析失败：接口未返回可播放的音频直链，请稍后重试或换一个分享链接。"
+                )
+            )
+            return
+
+        # 长直链默认截断展示（仅影响卡片文本，实际播放/下载仍用完整地址）
+        display_limit = 96 if msg_cfg.get("shorten_music_link", True) else 0
+        text = _format_music_card(plat, mf, display_limit=display_limit)
         
         # 尝试发送语音消息
         voice_sent = False
         if msg_cfg.get("send_voice_message") and audio:
             try:
                 logger.info("尝试发送语音消息: %s", audio)
-                max_size_mb = int(msg_cfg.get("voice_max_size_mb", 10))
+                max_size_mb = _to_int(msg_cfg.get("voice_max_size_mb"), 10)
                 temp_audio = await _download_audio(str(audio), timeout_sec=self._http_cfg()[0], max_size_mb=max_size_mb)
                 if temp_audio:
-                    wav_path = _convert_to_wav(temp_audio, max_duration_sec=int(msg_cfg.get("voice_max_duration", 60)))
+                    wav_path = _convert_to_wav(temp_audio, max_duration_sec=_to_int(msg_cfg.get("voice_max_duration"), 60))
                     if wav_path and os.path.exists(wav_path):
                         try:
                             voice_node = Record(file=wav_path, url=wav_path)
