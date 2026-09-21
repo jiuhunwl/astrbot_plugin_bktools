@@ -353,6 +353,15 @@
         "default": true,
         "hint": "关闭后仅发送视频、图片或资源链接。"
       },
+      "show_extended_metadata": {
+        "description": "显示扩展元信息（大小/时长/画质/标签/发布时间）",
+        "type": "bool",
+        "default": true,
+        "condition": {
+          "short_video_text_metadata": true
+        },
+        "hint": "按统一契约展示视频大小、时长、画质、标签与发布时间，让整合卡片信息更完整。"
+      },
       "pack_send_video": {
         "description": "使用 Video 组件发送视频",
         "type": "bool",
@@ -622,6 +631,15 @@
           "advanced_settings": true
         }
       },
+      "path_live_photo_image": {
+        "description": "实况项内封面图字段路径",
+        "type": "string",
+        "default": "image",
+        "condition": {
+          "advanced_settings": true
+        },
+        "hint": "用于统计并展示「实况封面：共 N 张」。"
+      },
       "path_music_title": {
         "description": "背景音乐标题字段路径",
         "type": "string",
@@ -645,6 +663,68 @@
         "condition": {
           "advanced_settings": true
         }
+      },
+      "path_duration": {
+        "description": "视频时长字段路径（秒）",
+        "type": "string",
+        "default": "duration",
+        "condition": {
+          "advanced_settings": true
+        },
+        "hint": "统一契约字段。展示时自动格式化为 00:15 / 1:01:01。"
+      },
+      "path_size": {
+        "description": "视频大小字段路径（字节）",
+        "type": "string",
+        "default": "size",
+        "condition": {
+          "advanced_settings": true
+        },
+        "hint": "统一契约字段。展示时按 1024 进制自动换算为 KB/MB/GB。"
+      },
+      "path_size_label": {
+        "description": "视频大小标签字段路径",
+        "type": "string",
+        "default": "size_label",
+        "condition": {
+          "advanced_settings": true
+        },
+        "hint": "仅在 size 缺失或为 0 时作为兜底展示；size 有效时按数值重新计算。"
+      },
+      "path_quality": {
+        "description": "视频画质字段路径",
+        "type": "string",
+        "default": "quality",
+        "condition": {
+          "advanced_settings": true
+        }
+      },
+      "path_create_time": {
+        "description": "作品发布时间戳字段路径（秒/毫秒）",
+        "type": "string",
+        "default": "create_time",
+        "condition": {
+          "advanced_settings": true
+        },
+        "hint": "毫秒时间戳会按契约自动除以 1000，并按 Asia/Shanghai 展示。"
+      },
+      "path_publish_time": {
+        "description": "作品发布时间文本字段路径",
+        "type": "string",
+        "default": "publish_time",
+        "condition": {
+          "advanced_settings": true
+        },
+        "hint": "已格式化的发布时间优先沿用；为空时由 create_time 推导。"
+      },
+      "path_tags": {
+        "description": "作品标签字段路径",
+        "type": "string",
+        "default": "extra.tags",
+        "condition": {
+          "advanced_settings": true
+        },
+        "hint": "留空时自动尝试 extra.tags、tags、extra.tag_list 等常见结构。"
       }
     }
   },

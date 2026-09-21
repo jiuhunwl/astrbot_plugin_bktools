@@ -1,5 +1,7 @@
 manual_upload/
 astrbot_plugin_bktools.zip
+astrbot_plugin_bktools-v*.zip
+RELEASE_NOTES_v*.md
 __pycache__/
 *.pyc
 .workbuddy/

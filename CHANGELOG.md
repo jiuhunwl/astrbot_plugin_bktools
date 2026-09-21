@@ -4,12 +4,35 @@
 
 格式参考 Keep a Changelog，并遵循语义化版本管理思路。
 
+## [v1.6.5] - 2026-09-21
+
+### Added
+
+- 消息整合卡片按统一响应契约（video-parser-json-contract）补齐字段，固定顺序输出：标题、类型、作者、时长、大小、画质、图集数、实况数、实况封面数、标签、简介、原声、原声链接、视频直链、发布时间、原始链接
+- 视频展示 `size`（按 1024 进制换算为 `37.43MB` 这类标签，≤2 位小数、无尾随 0）、`duration`（格式化为 `00:15` / `1:01:01`）、`quality`、`extra.tags` 标签
+- 图集保留「图集：共 N 张」；实况额外展示「实况：共 N 个」与「实况封面：共 N 张」
+- 展示发布时间：`create_time` 毫秒时间戳自动除以 1000 归一化，`publish_time` 按 Asia/Shanghai 推导（接口已格式化的值优先沿用），非法/缺失一律留空，不用当前时间冒充
+- 新增字段路径配置：`path_duration`、`path_size`、`path_size_label`、`path_quality`、`path_create_time`、`path_publish_time`、`path_tags`、`path_live_photo_image`，以及 `message.show_extended_metadata` 开关
+
+### Fixed
+
+- 修复批量输出阈值配置留空（`None`）或填写非数字时 `int()` 抛 `TypeError`、导致整个解析流程失败的问题；配置读取统一走容错解析
+- 修复批量输出把整段原始 JSON 当作普通文本刷屏的问题：现在固定发送「可读摘要卡片 + 完整接口响应」的合并转发打包消息，微信平台降级为逐条普通消息
+- 修复解析失败时直接暴露原始响应码/内部异常文本的问题：接口与网络故障改为友好中文提示（不再出现 `502, message=...`），业务失败透传接口 `msg`，接口成功但无可用媒体时优先透传接口说明
+
+### Security
+
+- 批量输出会把接口完整响应发送到聊天，发送前递归遮蔽键名命中 `token`/`api_key`/`cookie`/`password` 等凭据词的字段；`monkey`/`author` 这类普通单词不会被误伤
+- 诊断辅助代码不再因异常对象自身 `__str__` 失败而抛出二次异常、覆盖原始错误
+
 ## [v1.6.4] - 2026-08-18
 
 ### Fixed
 
+- 修复解析接口返回 5xx（如 502）时只显示通用 `upstream server error`、无法看到上游真实错误的问题：现在会尽力读取上游错误响应体，优先提取 `msg`/`message`/`error`/`detail` 等业务字段透传给用户（非 JSON 则剥离 HTML 提取文本），并对 URL 隐藏、敏感参数打码后展示；完整错误仍保留在服务端日志
 - 修复 WebUI 配置面板中自定义请求头输入框一直显示 loading 的问题：`dict` 类型误加了 `editor_mode` 导致前端代码编辑器加载失败，已移除；现在显示为原生「逐条添加键值对」输入框
 - 修复自定义请求头「保存后重载即丢失」的问题：根因是 AstrBot 框架 `AstrBotConfig.check_config_integrity()` 会把 schema 中默认值为空 `dict` 的配置项（如各处的 `headers`）当作「子配置」白名单递归清理——用户添加的键不在参考配置中被判定为多余键丢弃，且 `has_new=True` 触发立即写回，导致保存的请求头在插件热重载后永久丢失。插件启动时对框架应用等价官方修复补丁（AstrBotDevs/AstrBot issue #9512 / PR #9516）：参考值为空 dict 时直接保留用户全部键值对，不再递归清理；非空参考值（object 子配置）行为保持不变；补丁幂等、可安全重复加载
+- 修复 AstrBot 老版本（如 v4.25.5）中自定义请求头「根本保存不了」的问题：老版本框架的 `DEFAULT_VALUE_MAP` 不含 `dict` 类型，插件配置 `_conf_schema.json` 中 4 处 `type: "dict"` 会让 `_config_schema_to_default_config()` 直接抛 `TypeError: 不受支持的配置类型 dict`，导致配置无法初始化、WebUI 保存不生效。插件启动时向 `DEFAULT_VALUE_MAP` 原地注入 `"dict": {}`（老代码处立即生效），master 及后续版本本身已支持该类型，注入幂等无害
 - 多平台适配（重点微信系 gewechat/wechatpadpro）：微信协议端不支持 Nodes 合并转发，会渲染为 `com.tencent.multimsg`「聊天记录」卡片（节点昵称不生效、内容被拼接为「昵称: 内容」、易被客户端限制）。现在微信平台上：作品打包/列表自动降级为逐条普通消息发送，长 JSON 自动分条普通文本发送，不再产生聊天记录卡片
 - 修复短视频/抖音主页/网易云/音乐解析失败时，将异常原文（可能包含带鉴权 key 的完整接口地址）直接发送到聊天消息导致接口 key 泄露的问题：发送给用户前统一脱敏（隐藏 URL、对 key/token/sign 等敏感 query 参数打码、截断长度），完整错误仅保留在服务端日志
 - 修复短视频解析结果发送出现 `WebSocket API call timeout` 时日志误导的问题：实测中该超时多为「延迟送达」——平台（如 NapCat）仍在后台下载/上传大视频，约数分钟后才真正发出打包卡片，并非消息丢失

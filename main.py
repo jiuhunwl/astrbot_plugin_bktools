@@ -17,6 +17,7 @@ import tempfile
 import time
 from contextlib import asynccontextmanager, contextmanager
 from contextvars import ContextVar
+from datetime import datetime, timedelta, timezone
 from functools import wraps
 from collections.abc import Mapping
 from typing import Any, Dict, List, Optional, Tuple
@@ -152,7 +153,7 @@ except ImportError:
     )
 
 
-PLUGIN_VERSION = "1.6.4"
+PLUGIN_VERSION = "1.6.5"
 
 
 def _cfg(root: Any, *keys: str, default: Any = None) -> Any:
@@ -195,6 +196,230 @@ def _sanitize_user_error(err: Any, limit: int = 200) -> str:
     if len(text) > limit:
         text = text[:limit] + "…"
     return text or "未知错误（详情见日志）"
+
+
+# ── 统一响应契约（video-parser-json-contract）字段格式化 ────────────────────
+# 固定使用 Asia/Shanghai 计算 publish_time，避免受服务器本地时区影响；
+# 极少数缺少 tzdata 的环境回退到固定 UTC+8。
+try:
+    from zoneinfo import ZoneInfo as _ZoneInfo
+
+    _CN_TZ: Any = _ZoneInfo("Asia/Shanghai")
+except Exception:  # pragma: no cover - 缺少 tzdata 时回退
+    _CN_TZ = timezone(timedelta(hours=8))
+
+_SIZE_UNITS = ("B", "KB", "MB", "GB", "TB", "PB")
+# 资源类型 → 展示用中文标签（未知类型保留原值）
+_RESOURCE_TYPE_LABELS = {"video": "视频", "image": "图集", "live": "实况"}
+# 统一契约里可能承载标签的字段路径（按优先级）
+_TAG_PATHS = ("extra.tags", "tags", "extra.tag_list", "tag_list", "extra.topics")
+
+
+def _format_size_label(size: Any) -> str:
+    """把字节数格式化为 1024 进制标签（≤2 位小数、不留尾随 0）。
+
+    契约示例：39245943 -> "37.43MB"、1048576 -> "1MB"、0 -> ""。
+    """
+    if isinstance(size, bool):
+        return ""
+    try:
+        value = float(size)
+    except (TypeError, ValueError):
+        return ""
+    if not (value > 0) or value != value or value in (float("inf"), float("-inf")):
+        return ""
+    index = 0
+    while value >= 1024 and index < len(_SIZE_UNITS) - 1:
+        value /= 1024.0
+        index += 1
+    text = f"{value:.2f}".rstrip("0").rstrip(".")
+    return f"{text}{_SIZE_UNITS[index]}"
+
+
+def _format_duration(seconds: Any) -> str:
+    """把秒数格式化为 mm:ss / hh:mm:ss；非法、非正数返回空串。"""
+    if isinstance(seconds, bool):
+        return ""
+    try:
+        total = float(seconds)
+    except (TypeError, ValueError):
+        return ""
+    if not (total > 0) or total != total or total in (float("inf"), float("-inf")):
+        return ""
+    total_int = int(total)
+    hours, remainder = divmod(total_int, 3600)
+    minutes, secs = divmod(remainder, 60)
+    if hours:
+        return f"{hours:d}:{minutes:02d}:{secs:02d}"
+    return f"{minutes:02d}:{secs:02d}"
+
+
+def _normalize_unix_seconds(value: Any) -> int:
+    """把作品时间戳归一化为 Unix 秒。
+
+    契约要求：≥ 1000000000000 的数值按毫秒处理（除以 1000 并截断小数），
+    仅接受可表示、有限的合法时间戳，其余返回 0。
+    """
+    if isinstance(value, bool):
+        return 0
+    try:
+        number = float(value)
+    except (TypeError, ValueError):
+        return 0
+    if not (number > 0) or number != number or number in (float("inf"), float("-inf")):
+        return 0
+    if number >= 1_000_000_000_000:
+        number /= 1000.0
+    seconds = int(number)
+    if seconds < 1 or seconds > 253402300799:  # 9999-12-31 23:59:59 UTC 上界
+        return 0
+    return seconds
+
+
+def _format_publish_time(create_time: Any, publish_time: Any = None) -> str:
+    """优先采用接口已格式化的 publish_time，否则由 create_time 推导。
+
+    推导结果固定为 Asia/Shanghai 的 YYYY-MM-DD HH:mm:ss；未知返回空串。
+    """
+    text = str(publish_time or "").strip()
+    if text and ("-" in text or ":" in text):
+        return text
+    seconds = _normalize_unix_seconds(create_time or text)
+    if not seconds:
+        return ""
+    try:
+        moment = datetime.fromtimestamp(seconds, tz=_CN_TZ)
+    except (OverflowError, OSError, ValueError):
+        return ""
+    return moment.strftime("%Y-%m-%d %H:%M:%S")
+
+
+def _normalize_resource_type(value: Any) -> str:
+    return str(value or "").strip().lower()
+
+
+def _to_int(value: Any, default: int) -> int:
+    """容错地把配置值转为 int：None/空/非数字回退默认值，避免解析崩溃。"""
+    if isinstance(value, bool):
+        return default
+    try:
+        return int(value)
+    except (TypeError, ValueError):
+        return default
+
+
+# 明确属于凭据的键名 token（按非字母数字切分后做精确匹配，避免误伤
+# monkey/author/design 这类普通单词）。
+_SENSITIVE_KEY_TOKENS = frozenset(
+    {
+        "key", "keys", "token", "tokens", "secret", "sign", "signature", "sig",
+        "accesskey", "apikey", "appkey", "auth", "authorization", "cookie",
+        "cookies", "password", "passwd", "pwd", "credential", "credentials", "cred",
+    }
+)
+
+
+def _is_sensitive_key(key: str) -> bool:
+    tokens = [t for t in re.split(r"[^a-z0-9]+", str(key).lower()) if t]
+    if not tokens:
+        return False
+    if any(t in _SENSITIVE_KEY_TOKENS for t in tokens):
+        return True
+    # 兼容 apiKey / accessToken 这类无分隔的驼峰或拼接写法
+    return "".join(tokens) in _SENSITIVE_KEY_TOKENS
+
+
+def _redact_sensitive(value: Any, depth: int = 0) -> Any:
+    """发送完整响应到聊天前，递归遮蔽明显属于凭据的键值。
+
+    批量输出会把接口完整响应发到群聊，响应中若夹带 token/cookie 等字段
+    会构成凭据泄露；这里仅遮蔽键名命中敏感词的项，其余结构原样保留。
+    错误提示路径由 _sanitize_user_error 负责，二者互补。
+    """
+    if depth > 12:
+        return value
+    if isinstance(value, dict):
+        return {
+            key: ("***" if isinstance(key, str) and _is_sensitive_key(key)
+                  else _redact_sensitive(item, depth + 1))
+            for key, item in value.items()
+        }
+    if isinstance(value, list):
+        return [_redact_sensitive(item, depth + 1) for item in value]
+    if isinstance(value, tuple):
+        return tuple(_redact_sensitive(item, depth + 1) for item in value)
+    return value
+
+
+# 从 "(upstream: xxx)" 中还原上游接口给出的业务错误文本
+_UPSTREAM_DETAIL_RE = re.compile(r"upstream:\s*(.+?)\)\s*$", re.DOTALL)
+# 这些是接口的通用成功文案，不代表有效错误信息，命中时改用本地友好提示
+_GENERIC_SUCCESS_MSGS = frozenset(
+    {"解析成功", "成功", "ok", "success", "succeed", "done", "200"}
+)
+
+
+def _extract_upstream_detail(err: Any) -> str:
+    """取出 aiohttp 5xx 异常里已透传的上游 msg 片段并脱敏。
+
+    诊断辅助代码本身不得抛出异常，否则会用一个无关的错误覆盖原始失败；
+    因此这里对 message 与 str(err) 分别做保护。
+    """
+    raw = ""
+    try:
+        raw = getattr(err, "message", None) or ""
+    except Exception:
+        raw = ""
+    if not raw:
+        try:
+            raw = str(err or "")
+        except Exception:
+            raw = ""
+    match = _UPSTREAM_DETAIL_RE.search(str(raw))
+    if not match:
+        return ""
+    return _sanitize_user_error(match.group(1), limit=120)
+
+
+def _describe_parse_error(err: Any, label: str = "解析") -> str:
+    """把解析异常转成面向用户的友好提示。
+
+    - 接口/网络故障（5xx、超时、连接失败、熔断）→ 友好提示，不暴露原始响应码；
+    - 上游给出了可读 msg → 一并带上，便于用户判断；
+    - 业务失败（接口正常返回但 code 非成功）→ 直接透传接口 msg。
+
+    label 用于业务失败兜底文案，例如 label="抖音主页解析" → "抖音主页解析失败：…"。
+    """
+    if isinstance(err, CircuitOpenError):
+        return _sanitize_user_error(err) or "解析服务暂时不可用，请稍后重试"
+    if isinstance(err, aiohttp.ClientResponseError):
+        status = int(getattr(err, "status", 0) or 0)
+        upstream = _extract_upstream_detail(err)
+        tail = f"（{upstream}）" if upstream else ""
+        if status == 429:
+            return f"解析接口请求过于频繁{tail}，请稍后重试"
+        if status >= 500:
+            return f"解析接口暂时不可用{tail}，请稍后重试"
+        if status >= 400:
+            return f"解析请求被接口拒绝{tail}，请检查接口配置"
+        return f"解析接口返回异常{tail}，请稍后重试"
+    if isinstance(err, (asyncio.TimeoutError, aiohttp.ServerTimeoutError)):
+        return "解析接口响应超时，请稍后重试"
+    if isinstance(err, aiohttp.ClientConnectionError):
+        return "无法连接解析接口，请检查网络或接口地址是否正确"
+    if isinstance(err, ValueError):
+        text = _sanitize_user_error(err, limit=160)
+        if text:
+            return f"{label}失败：{text}"
+    return f"{label}失败，请稍后重试（详情见服务端日志）"
+
+
+def _empty_result_hint(json_root: Any, cfg_sv: Dict[str, Any]) -> str:
+    """接口返回成功但没有可用媒体时，优先透传接口 msg。"""
+    msg = str(get_path(json_root, cfg_sv.get("path_msg") or "msg") or "").strip()
+    if msg and msg.lower() not in _GENERIC_SUCCESS_MSGS and msg not in _GENERIC_SUCCESS_MSGS:
+        return f"未解析到有效内容：{_sanitize_user_error(msg, limit=160)}"
+    return "未解析到有效内容（作品可能已删除、设为私密，或该链接暂不支持解析）"
 
 
 def _plain_config_value(value: Any) -> Any:
@@ -366,20 +591,60 @@ def _first_video_url(data: Any, cfg_sv: Dict[str, Any], json_root: Dict[str, Any
     return None
 
 
-def _live_photo_videos(data: Any, cfg_sv: Dict[str, Any], j: Dict[str, Any]) -> List[str]:
+def _live_photo_items(data: Any, cfg_sv: Dict[str, Any], j: Dict[str, Any]) -> List[Dict[str, Any]]:
+    """返回实况相册条目列表（原样保留 image/video 配对结构）。"""
     lp = _rel_data(data, cfg_sv.get("path_live_photo_list") or "live_photo", j)
     if not isinstance(lp, list):
         return []
+    return [item for item in lp if isinstance(item, dict)]
+
+
+def _live_photo_videos(data: Any, cfg_sv: Dict[str, Any], j: Dict[str, Any]) -> List[str]:
     sub = (cfg_sv.get("path_live_photo_video") or "video").strip() or "video"
     out: List[str] = []
-    for item in lp:
-        if isinstance(item, dict):
-            u = get_path(item, sub)
-            if u:
-                s = str(u).strip()
-                if s:
-                    out.append(s)
+    for item in _live_photo_items(data, cfg_sv, j):
+        u = get_path(item, sub)
+        if u:
+            s = str(u).strip()
+            if s:
+                out.append(s)
     return out
+
+
+def _live_photo_images(data: Any, cfg_sv: Dict[str, Any], j: Dict[str, Any]) -> List[str]:
+    """返回实况相册的封面图（image）列表，用于统计与展示。"""
+    sub = (cfg_sv.get("path_live_photo_image") or "image").strip() or "image"
+    out: List[str] = []
+    for item in _live_photo_items(data, cfg_sv, j):
+        u = get_path(item, sub)
+        if u:
+            s = str(u).strip()
+            if s:
+                out.append(s)
+    return out
+
+
+def _collect_tags(data: Any, cfg_sv: Dict[str, Any], j: Dict[str, Any]) -> List[str]:
+    """从接口响应中收集作品标签（去重保序、限制长度）。"""
+    configured = str(cfg_sv.get("path_tags") or "").strip()
+    paths = [configured] if configured else []
+    paths.extend(p for p in _TAG_PATHS if p not in paths)
+    for path in paths:
+        raw = _rel_data(data, path, j)
+        if isinstance(raw, dict):
+            raw = list(raw.keys())
+        if not isinstance(raw, list):
+            continue
+        out: List[str] = []
+        for item in raw:
+            if isinstance(item, dict):
+                item = item.get("name") or item.get("title") or item.get("tag_name")
+            text = str(item or "").strip().lstrip("#")
+            if text and text not in out:
+                out.append(text)
+        if out:
+            return out[:12]
+    return []
 
 
 def _make_image_node(url: str) -> Optional[Image]:
@@ -1403,13 +1668,22 @@ class BKToolsPlugin(Star):
         payload: Dict[str, Any],
         parse_token: Tuple[str, int],
         reason: str,
+        header_text: Optional[str] = None,
     ) -> bool:
-        """以单条纯文本发送解析接口原始 JSON，不拆分为作品消息。"""
+        """把接口响应作为消息发送。
+
+        - 未提供 header_text：短 JSON 走单条纯文本，长 JSON 走一条合并转发分片。
+        - 提供 header_text（批量超阈值）：固定走「可读摘要卡片 + 完整响应」的
+          打包消息，保证既能看到关键信息，又保留完整接口响应。
+        - 微信协议端不支持 Nodes，统一降级为逐条普通消息。
+        """
         if self._is_parse_cancelled(parse_token):
             logger.info("%s前收到停止解析指令，取消发送 JSON", reason)
             return False
+        header = (header_text or "").strip()
+        # 完整响应可能夹带凭据字段，发到聊天前先遮蔽
         json_text = json.dumps(
-            payload,
+            _redact_sensitive(payload),
             ensure_ascii=False,
             separators=(",", ":"),
             default=str,
@@ -1423,41 +1697,48 @@ class BKToolsPlugin(Star):
         )
         json_limit = max(text_limit, int(configured_json_limit or 0))
         try:
-            if len(json_text) <= text_limit:
-                result = event.plain_result(json_text)
-            elif self._is_wechat_platform(event):
+            if self._is_wechat_platform(event):
                 # 微信协议端不支持 Nodes 合并转发（渲染为「聊天记录」卡片且内容
-                # 被拼接成「昵称: 内容」），长 JSON 改为分条普通文本发送。
+                # 被拼接成「昵称: 内容」），统一改为分条普通文本发送。
                 if len(encoded) > json_limit:
                     raise ValueError("解析 JSON 超过配置的输出大小限制")
-                chunk_size = max(256, min(text_limit, 1500))
+                pieces: List[str] = [header] if header else []
+                if len(json_text) <= text_limit:
+                    pieces.append(json_text)
+                else:
+                    chunk_size = max(256, min(text_limit, 1500))
+                    pieces.extend(
+                        json_text[index : index + chunk_size]
+                        for index in range(0, len(json_text), chunk_size)
+                    )
                 sent_any = False
-                for index in range(0, len(json_text), chunk_size):
+                for piece in pieces:
                     if self._is_parse_cancelled(parse_token):
                         logger.info("%s微信分片发送过程中收到停止指令", reason)
                         break
                     outcome = await self._dispatch_send(
                         event,
-                        event.plain_result(json_text[index : index + chunk_size]),
-                        f"{reason}（JSON分片）",
+                        event.plain_result(piece),
+                        f"{reason}（普通消息分片）",
                         retry_same_payload=True,
                     )
                     if outcome == "ok":
                         sent_any = True
                 if not sent_any:
-                    logger.warning("%s，微信平台 JSON 分片均未发送成功", reason)
+                    logger.warning("%s，微信平台分片均未发送成功", reason)
                 return sent_any
+            if len(json_text) <= text_limit and not header:
+                result = event.plain_result(json_text)
             else:
                 if len(encoded) > json_limit:
                     raise ValueError("解析 JSON 超过配置的输出大小限制")
-                try:
-                    max_nodes = max(
-                        1,
-                        min(int(limits.get("json_forward_max_nodes", 100) or 100), 200),
-                    )
-                except (TypeError, ValueError):
-                    max_nodes = 100
-                # 以一条合并转发承载完整 JSON，避免本地 /tmp 文件在
+                max_nodes = max(
+                    1,
+                    min(_to_int(limits.get("json_forward_max_nodes"), 100), 200),
+                )
+                if header:
+                    max_nodes = max(1, max_nodes - 1)  # 预留摘要卡片节点
+                # 以一条合并转发承载完整内容，避免本地 /tmp 文件在
                 # AstrBot 与 OneBot/NapCat 分离部署时无法跨容器读取。
                 chunk_size = max(text_limit, (len(json_text) + max_nodes - 1) // max_nodes)
                 chunks = [
@@ -1465,11 +1746,14 @@ class BKToolsPlugin(Star):
                     for index in range(0, len(json_text), chunk_size)
                 ]
                 name, uid = self._bot_identity(event)
-                json_nodes = [
+                nodes: List[Node] = []
+                if header:
+                    nodes.append(Node(name=name, uin=uid, content=[Plain(header)]))
+                nodes.extend(
                     Node(name=name, uin=uid, content=[Plain(chunk)])
                     for chunk in chunks
-                ]
-                result = event.chain_result([Nodes(json_nodes)])
+                )
+                result = event.chain_result([Nodes(nodes)])
         except Exception as ex:
             logger.error("%s，构造解析 JSON 消息失败: %s", reason, ex)
             try:
@@ -1487,6 +1771,37 @@ class BKToolsPlugin(Star):
         # 超时/失败后不再重发相同 JSON（防重复），由上层决定是否释放去重标记。
         logger.warning("%s，JSON 发送未确认成功（%s），不再重发", reason, outcome)
         return False
+
+    async def _send_batch_full_response(
+        self,
+        event: AstrMessageEvent,
+        payload: Dict[str, Any],
+        data: Any,
+        cfg_sv: Dict[str, Any],
+        link: str,
+        parse_token: Tuple[str, int],
+        reason: str,
+    ) -> bool:
+        """批量内容超阈值：把接口完整响应作为一条打包消息发送。
+
+        打包内容 = 可读摘要卡片（标题/类型/作者/数量/原声/链接…）+ 完整响应分片，
+        避免像旧版那样把整段原始 JSON 直接当普通文本刷到群里。
+        """
+        msg_cfg = _cfg(self._runtime_config(), "message", default={}) or {}
+        header = ""
+        if bool(msg_cfg.get("short_video_text_metadata", True)):
+            header = self._format_short_video_text(
+                cfg_sv, data, payload, include_video_line=False
+            )
+            if header == "（无文本信息）":
+                header = ""
+        if header and bool(msg_cfg.get("pack_append_original_link", True)):
+            stripped = (link or "").strip()
+            if stripped and stripped not in header:
+                header = f"{header.rstrip()}\n原始链接：{stripped}"
+        return await self._send_json_result(
+            event, payload, parse_token, reason, header_text=header or None
+        )
 
     async def _send_forward_as_plain(
         self,
@@ -1888,8 +2203,9 @@ class BKToolsPlugin(Star):
             data = {}
         ok = _parse_success_codes(str(cfg_sv.get("success_codes", "200")))
         if not _code_ok(j, cfg_sv.get("path_code") or "code", ok):
-            msg = get_path(j, cfg_sv.get("path_msg") or "msg") or "接口返回失败"
-            raise ValueError(str(msg))
+            # 业务失败：透传接口 msg；msg 缺失时给可读兜底，不暴露原始响应码
+            msg = str(get_path(j, cfg_sv.get("path_msg") or "msg") or "").strip()
+            raise ValueError(msg or "接口未返回有效内容")
         return j, data
 
     def _format_short_video_text(
@@ -1899,34 +2215,92 @@ class BKToolsPlugin(Star):
         j: Dict[str, Any],
         *,
         include_video_line: bool = True,
+        show_extended: bool = True,
     ) -> str:
         lines: List[str] = []
         title = _rel_data(data, cfg_sv.get("path_title") or "title", j) or ""
         desc = _rel_data(data, cfg_sv.get("path_desc") or "desc", j) or ""
-        typ = _rel_data(data, cfg_sv.get("path_type") or "type", j) or ""
+        typ = _normalize_resource_type(_rel_data(data, cfg_sv.get("path_type") or "type", j))
         an = _rel_data(data, cfg_sv.get("path_author_name") or "author.name", j) or ""
         vurl = _first_video_url(data, cfg_sv, j)
-        mt = _rel_data(data, cfg_sv.get("path_music_title") or "music.title", j) or ""
-        ma = _rel_data(data, cfg_sv.get("path_music_author") or "music.author", j) or ""
-        mu = _rel_data(data, cfg_sv.get("path_music_url") or "music.url", j) or ""
+
+        imgs = _rel_data(data, cfg_sv.get("path_images_list") or "images", j)
+        img_count = len(imgs) if isinstance(imgs, list) else 0
+        live_count = len(_live_photo_items(data, cfg_sv, j))
+        live_img_count = len(_live_photo_images(data, cfg_sv, j))
+        # 接口未给出 type 时按实际载荷推断，保证卡片信息完整
+        if not typ:
+            if live_count:
+                typ = "live"
+            elif img_count:
+                typ = "image"
+            elif vurl:
+                typ = "video"
+
+        # 视频类元信息（统一契约：图集/实况的 duration/size/quality 为空或 null）
+        is_video_like = typ == "video" or bool(vurl)
+        duration_s = ""
+        size_label = ""
+        quality_s = ""
+        if show_extended and is_video_like:
+            duration_s = _format_duration(
+                _rel_data(data, cfg_sv.get("path_duration") or "duration", j)
+            )
+            size_label = _format_size_label(
+                _rel_data(data, cfg_sv.get("path_size") or "size", j)
+            )
+            if not size_label:
+                # size 缺失/为 0 时，退回接口给出的 size_label（契约允许为空串）
+                provided = str(
+                    _rel_data(data, cfg_sv.get("path_size_label") or "size_label", j) or ""
+                ).strip()
+                if provided:
+                    size_label = provided
+            quality_s = str(
+                _rel_data(data, cfg_sv.get("path_quality") or "quality", j) or ""
+            ).strip()
+
+        tags: List[str] = _collect_tags(data, cfg_sv, j) if show_extended else []
+
         if title:
             lines.append(f"标题：{title}")
         if typ:
-            lines.append(f"类型：{typ}")
+            lines.append(f"类型：{_RESOURCE_TYPE_LABELS.get(typ, typ)}")
         if an:
             lines.append(f"作者：{an}")
+        if duration_s:
+            lines.append(f"时长：{duration_s}")
+        if size_label:
+            lines.append(f"大小：{size_label}")
+        if quality_s:
+            lines.append(f"画质：{quality_s}")
+        if img_count:
+            lines.append(f"图集：共 {img_count} 张")
+        if live_count:
+            lines.append(f"实况：共 {live_count} 个")
+            if live_img_count:
+                lines.append(f"实况封面：共 {live_img_count} 张")
+        if tags:
+            lines.append("标签：" + " ".join(f"#{t}" for t in tags))
         if desc and str(desc) != str(title):
             lines.append(f"简介：{desc}")
         if vurl and include_video_line:
             lines.append(f"视频直链：{vurl}")
-        imgs = _rel_data(data, cfg_sv.get("path_images_list") or "images", j)
-        if isinstance(imgs, list) and imgs:
-            lines.append(f"图集：共 {len(imgs)} 张")
+        mt = _rel_data(data, cfg_sv.get("path_music_title") or "music.title", j) or ""
+        ma = _rel_data(data, cfg_sv.get("path_music_author") or "music.author", j) or ""
+        mu = _rel_data(data, cfg_sv.get("path_music_url") or "music.url", j) or ""
         if mt or ma or mu:
             parts = [x for x in (str(mt) if mt else "", str(ma) if ma else "") if x]
             lines.append("原声：" + " / ".join(parts))
             if mu:
                 lines.append(f"原声链接：{mu}")
+        if show_extended and is_video_like:
+            published = _format_publish_time(
+                _rel_data(data, cfg_sv.get("path_create_time") or "create_time", j),
+                _rel_data(data, cfg_sv.get("path_publish_time") or "publish_time", j),
+            )
+            if published:
+                lines.append(f"发布时间：{published}")
         return "\n".join(lines) if lines else "（无文本信息）"
 
     @_tracked_parse
@@ -1944,7 +2318,7 @@ class BKToolsPlugin(Star):
                 logger.info("短视频解析已停止，不再发送失败消息: %s", link)
                 return
             logger.warning("短视频解析失败: %s，链接: %s", e, link)
-            await event.send(event.plain_result(f"短视频解析失败：{_sanitize_user_error(e)}"))
+            await event.send(event.plain_result(_describe_parse_error(e)))
             return
 
         if self._is_parse_cancelled(parse_token):
@@ -1970,26 +2344,35 @@ class BKToolsPlugin(Star):
         img_total_count = 0
         if isinstance(imgs, list):
             img_total_count = len(imgs)
-            lim = int(msg_cfg.get("max_images_per_work", 9) or 9)
+            lim = max(1, _to_int(msg_cfg.get("max_images_per_work"), 9))
             for x in imgs[:lim]:
                 if x:
                     img_list.append(str(x).strip())
 
-        # 批量输出控制：检查图集/实况数量是否超过阈值
+        # 批量输出控制：检查图集/实况数量是否超过阈值。
+        # 配置解析一律走 _to_int 容错，避免 WebUI 留空(None)导致 int() 崩溃而
+        # 让整个解析流程直接失败。
         batch_cfg = _cfg(self._runtime_config(), "batch_output", default={}) or {}
         direct_json_enabled = bool(batch_cfg.get("direct_json_enabled", False))
-        img_threshold = int(batch_cfg.get("image_count_threshold", 20))
-        live_threshold = int(batch_cfg.get("live_photo_count_threshold", 10))
-        
+        img_threshold = _to_int(batch_cfg.get("image_count_threshold"), 20)
+        live_threshold = _to_int(batch_cfg.get("live_photo_count_threshold"), 10)
+
         if direct_json_enabled:
             live_count = len(live_vs)
             if img_total_count > img_threshold or live_count > live_threshold:
                 logger.info(
-                    "批量输出: 图集数量(%d)超过阈值(%d)或实况数量(%d)超过阈值(%d)，直接输出JSON",
-                    img_total_count, img_threshold, live_count, live_threshold
+                    "批量输出: 图集数量(%d)超过阈值(%d)或实况数量(%d)超过阈值(%d)，"
+                    "发送完整响应的打包消息",
+                    img_total_count, img_threshold, live_count, live_threshold,
                 )
-                await self._send_json_result(
-                    event, j, parse_token, "批量内容超过阈值"
+                await self._send_batch_full_response(
+                    event,
+                    j,
+                    data,
+                    cfg_sv,
+                    link,
+                    parse_token,
+                    f"批量内容超过阈值（图集 {img_total_count} 张 / 实况 {live_count} 个）",
                 )
                 return
 
@@ -1998,15 +2381,27 @@ class BKToolsPlugin(Star):
         av = _rel_data(data, cfg_sv.get("path_author_avatar") or "author.avatar", j)
         av_s = str(av).strip() if av else ""
 
+        # 接口成功但没有任何可用媒体：按契约不透传原始响应，改为可读提示
+        # （优先使用接口 msg，例如“作品不存在/已删除”）。
+        if not video_urls and not img_list and not cover_s:
+            logger.warning(
+                "短视频解析成功但无可用媒体，链接: %s，接口 msg: %s",
+                link,
+                get_path(j, cfg_sv.get("path_msg") or "msg"),
+            )
+            await event.send(event.plain_result(_empty_result_hint(j, cfg_sv)))
+            return
+
         pack_send_video = bool(msg_cfg.get("pack_send_video", True))
         pack_include_cover = bool(msg_cfg.get("pack_include_cover", True))
         text_meta = bool(msg_cfg.get("short_video_text_metadata", True))
+        show_extended = bool(msg_cfg.get("show_extended_metadata", True))
 
         # 视频文件大小阈值控制
         vth = _cfg(self._runtime_config(), "video_threshold", default={}) or {}
         force_link = bool(vth.get("force_link_enabled", False))
         threshold_on = bool(vth.get("threshold_enabled", True))
-        threshold_mb = int(vth.get("threshold_mb", 100) or 100)
+        threshold_mb = _to_int(vth.get("threshold_mb"), 100)
 
         # 视频资源会在后续作为 Video 节点或独立直链节点加入消息，元信息中
         # 不再重复展示同一个地址。
@@ -2016,6 +2411,7 @@ class BKToolsPlugin(Star):
             data,
             j,
             include_video_line=include_video_line,
+            show_extended=show_extended,
         )
         if bool(msg_cfg.get("pack_append_original_link", True)) and link:
             original_line = f"原始链接：{link.strip()}"
@@ -2233,7 +2629,7 @@ class BKToolsPlugin(Star):
                 logger.info("抖音主页解析已停止，不再发送失败消息: %s", profile_url)
                 return
             logger.warning("抖音主页解析失败: %s，链接: %s", e, profile_url)
-            await event.send(event.plain_result(f"抖音主页解析失败：{_sanitize_user_error(e)}"))
+            await event.send(event.plain_result(_describe_parse_error(e, "抖音主页解析")))
             return
 
         if self._is_parse_cancelled(parse_token):
@@ -2343,7 +2739,7 @@ class BKToolsPlugin(Star):
                 j = await self._request_json("GET", f"{ep}{sep}{q}", headers=ne_headers)
         except Exception as e:
             logger.warning("网易云搜索失败: %s", e)
-            await event.send(event.plain_result(f"网易云搜索失败：{_sanitize_user_error(e)}"))
+            await event.send(event.plain_result(_describe_parse_error(e, "网易云搜索")))
             return
         dbg, dbg_len = self._debug_cfg()
         if dbg:
@@ -2562,7 +2958,7 @@ class BKToolsPlugin(Star):
                             j = j2
         except Exception as e:
             logger.warning("音乐解析失败: %s", e)
-            await event.send(event.plain_result(f"音乐解析失败：{_sanitize_user_error(e)}"))
+            await event.send(event.plain_result(_describe_parse_error(e, "音乐解析")))
             return
 
         dbg, dbg_len = self._debug_cfg()
