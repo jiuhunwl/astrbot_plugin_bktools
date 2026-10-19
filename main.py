@@ -1,6 +1,8 @@
 """
 AstrBot 插件：BugPk 工具集（短视频解析、网易云搜歌、多平台音乐链解析）。
 说明：音乐搜索仅走网易云配置；QQ/汽水/酷我等仅支持分享链接解析。
+v1.7.0 起新增开放 API 活动发放：/bk领奖 走平台 /open-api/redeem-codes
+（GitHub star + 问卷双校验），/bk开放Key 与 /bk活动 为管理命令。
 """
 
 from __future__ import annotations
@@ -31,6 +33,38 @@ from astrbot.api.message_components import Image, Node, Nodes, Plain, Record, Vi
 from astrbot.api.star import Context, Star, register
 from astrbot.core.star.filter.event_message_type import EventMessageType
 
+# 开放 API 活动发放是可选功能。部分部署方式（只覆盖 main.py 的手动更新、旧版增量覆盖）
+# 会缺少配套模块，曾导致 "No module named 'campaign_manager'" 让整个插件加载失败，
+# 连短视频/音乐解析一起不可用。这里对可选模块做 fail-soft 导入：缺失时只停用活动发放。
+try:
+    from campaign_manager import (
+        CampaignManager,
+        CampaignStateStore,
+        ClaimResult,
+    )
+    from github_star import GitHubStarVerifier
+    import open_api_client as _oca
+    from open_api_client import KEY_TYPE_ADMIN, OpenApiClient, OpenApiError
+    import survey_adapter as _sa
+
+    _CAMPAIGN_READY = True
+except Exception as _campaign_import_exc:  # pragma: no cover - 仅部署缺文件时触发
+    CampaignManager = None  # type: ignore[assignment]
+    CampaignStateStore = None  # type: ignore[assignment]
+    ClaimResult = None  # type: ignore[assignment]
+    GitHubStarVerifier = None  # type: ignore[assignment]
+    _oca = None  # type: ignore[assignment]
+    KEY_TYPE_ADMIN = None  # type: ignore[assignment]
+    OpenApiClient = None  # type: ignore[assignment]
+    OpenApiError = None  # type: ignore[assignment]
+    _sa = None  # type: ignore[assignment]
+    _CAMPAIGN_READY = False
+    logger.warning(
+        "可选模块缺失，活动发放功能已停用（短视频/音乐解析不受影响）: %s: %s",
+        type(_campaign_import_exc).__name__,
+        _campaign_import_exc,
+    )
+
 
 def _patch_astrbot_dict_config_preservation() -> None:
     """修复 AstrBot 框架缺陷：dict 类型配置项（自由键值对）无法保存/被清空。
@@ -55,10 +89,12 @@ def _patch_astrbot_dict_config_preservation() -> None:
         from astrbot.core.config import default as _cfg_default
         from astrbot.core.config.astrbot_config import AstrBotConfig
 
-        # 缺陷 1：老版本 DEFAULT_VALUE_MAP 不识别 dict 类型（原地注入，幂等）
-        if "dict" not in _cfg_default.DEFAULT_VALUE_MAP:
-            _cfg_default.DEFAULT_VALUE_MAP["dict"] = {}
-            logger.info("[bktools] 已为 DEFAULT_VALUE_MAP 注入 dict 类型支持")
+        # 缺陷 1：老版本 DEFAULT_VALUE_MAP 不识别 dict / template_list 类型
+        # （template_list 自 v4.10.4 引入，活动配置 campaigns 依赖它）
+        for _extra_type, _extra_default in (("dict", {}), ("template_list", [])):
+            if _extra_type not in _cfg_default.DEFAULT_VALUE_MAP:
+                _cfg_default.DEFAULT_VALUE_MAP[_extra_type] = _extra_default
+                logger.info("[bktools] 已为 DEFAULT_VALUE_MAP 注入 %s 类型支持", _extra_type)
 
         if getattr(AstrBotConfig, "_bktools_dict_preservation_patched", False):
             return
@@ -153,7 +189,7 @@ except ImportError:
     )
 
 
-PLUGIN_VERSION = "1.6.6"
+PLUGIN_VERSION = "1.7.1"
 
 
 def _cfg(root: Any, *keys: str, default: Any = None) -> Any:
@@ -507,8 +543,38 @@ _SENSITIVE_KEY_TOKENS = frozenset(
         "key", "keys", "token", "tokens", "secret", "sign", "signature", "sig",
         "accesskey", "apikey", "appkey", "auth", "authorization", "cookie",
         "cookies", "password", "passwd", "pwd", "credential", "credentials", "cred",
+        # 开放 Key（opk_ / opka_）：配置回显与批量输出都要打码
+        "openkey", "opk", "opka", "openapi",
     }
 )
+
+# 配置回显被脱敏后的占位形态（如 opka_**** / sk-****abcd / ********）：
+# 这类值存回配置后根本不能用，必须明确提示，而不是当成有效 Key 静默失败。
+_SENSITIVE_REDACTED_KEY_RE = re.compile(r"[*•×]{4,}")
+
+# 活动领取结果 → 聊天文案（GRANTED 单独走成功模板，不在表里）；
+# 可选模块缺失时 ClaimResult 为 None，此时活动功能整体停用，表保持为空即可
+_CLAIM_USER_TEXT = {
+    ClaimResult.CAMPAIGN_NOT_FOUND: "没有找到这个活动 ID，用 /bk活动 列表 查看当前可参与的活动。",
+    ClaimResult.CAMPAIGN_DISABLED: "这个活动已经关闭了。",
+    ClaimResult.CAMPAIGN_NOT_STARTED: "这个活动还没开始，请稍后再来。",
+    ClaimResult.CAMPAIGN_EXPIRED: "这个活动已经结束了。",
+    ClaimResult.ALREADY_CLAIMED: "你在这个活动已经领过一次了，同一聊天账号每个活动限领一次。",
+    ClaimResult.COOLDOWN: "刚刚领过奖啦，稍微等一会儿再来。",
+    ClaimResult.IN_PROGRESS: "上一次领取还在处理中，稍等几秒再试一次。",
+    ClaimResult.STAR_NOT_CONFIGURED: "这个活动需要 GitHub 用户名，用法：/bk领奖 <活动ID> <GitHub用户名>",
+    ClaimResult.STAR_NOT_STARRED: "还没 star 这个仓库哦，先去 star 再来领奖。",
+    ClaimResult.STAR_USER_NOT_FOUND: "没找到这个 GitHub 用户名，请检查后重试（不含空格与大写）。",
+    ClaimResult.SURVEY_NOT_CONFIGURED: "这个活动的问卷没配置好，先找管理员处理一下。",
+    ClaimResult.SURVEY_NOT_MATCH: "联系方式和问卷记录对不上，请确认填表用的号码/邮箱一致。",
+    ClaimResult.SURVEY_UNAVAILABLE: "问卷查询服务暂时繁忙，请稍后再试。",
+    ClaimResult.KEY_TYPE_FORBIDDEN: "当前开放 Key 是普通用户 Key，没有发奖权限，请让管理员换成管理员作用域 Key（opka_）。",
+    ClaimResult.SCOPE_DENIED: "当前开放 Key 没有发奖权限（scope 不足），请联系管理员。",
+    ClaimResult.RATE_LIMITED: "领奖太频繁了，请稍后再试。",
+    ClaimResult.IP_FORBIDDEN: "当前网络出口没有加白名单，请联系管理员把出口 IP 加进开放 Key 白名单。",
+    ClaimResult.GENERATE_FAILED: "服务暂时繁忙，请稍后再试。",
+    ClaimResult.CONFIG_ERROR: "活动配置有误，请联系管理员。",
+} if ClaimResult is not None else {}
 
 
 def _is_sensitive_key(key: str) -> bool:
@@ -1113,11 +1179,92 @@ async def _get_url_content_length(url: str, timeout_sec: int = 15) -> Optional[i
     return None
 
 
+# 客户端引用/转发长文本时会在 URL 中间截断并追加省略号（QQ 引用约在第 79 字符处截断），
+# 例如 "https://v.douyin.com/WM5..."。尾部连续省略号是"链接不完整"的强信号。
+_TRUNCATED_URL_TAIL_RE = re.compile(r"(?:\.{2,}|…+)$")
+
+
+def _extract_url_candidates(text: str) -> List[Tuple[str, bool]]:
+    """从文本提取 (链接, 是否疑似被截断)。
+
+    处理中文/英文结尾标点，避免复制分享文案时把标点一起带进链接；
+    尾部原本是连续省略号的链接会被标记为"疑似截断"（残链，解析必然失败）。
+    """
+    tail_punc = ".,!?;:)]}，。！？；：）】》」』、…"
+    out: List[Tuple[str, bool]] = []
+    for match in re.finditer(r"https?://[^\s\]>\"']+", text or ""):
+        raw = match.group(0)
+        url = raw.rstrip(tail_punc)
+        if not url:
+            continue
+        out.append((url, bool(_TRUNCATED_URL_TAIL_RE.search(raw))))
+    return out
+
+
 def _extract_urls(text: str) -> List[str]:
-    raw_urls = re.findall(r"https?://[^\s\]>\"']+", text or "")
-    # 处理中文/英文结尾标点，避免复制分享文案时把标点一起带进链接
-    tail_punc = ".,!?;:)]}，。！？；：）】》」』、"
-    return [u.rstrip(tail_punc) for u in raw_urls if u.rstrip(tail_punc)]
+    return [url for url, _ in _extract_url_candidates(text)]
+
+
+def _quoted_message_texts(event: AstrMessageEvent) -> List[str]:
+    """取出引用/回复消息段里被引用消息的完整文本。
+
+    引用消息时 `event.message_str` 只含用户新输入的内容，可能为空；
+    部分客户端还会把引用内容截断成 "https://v.douyin.com/WM5..." 这类残链。
+    被引用消息的完整原文保存在 Reply 组件上（适配器通过 get_msg 拉取全量文本）。
+
+    通过特征属性（sender_id / sender_nickname）识别引用组件，
+    避免直接 import Reply 造成对 AstrBot 版本的硬依赖。
+    """
+    texts: List[str] = []
+    try:
+        chain = getattr(getattr(event, "message_obj", None), "message", None) or []
+    except Exception:
+        chain = []
+    for comp in chain:
+        if not (hasattr(comp, "sender_id") or hasattr(comp, "sender_nickname")):
+            continue
+        for attr in ("message_str", "text"):
+            value = getattr(comp, attr, None)
+            if value:
+                texts.append(str(value))
+                break
+        for sub in getattr(comp, "chain", None) or []:
+            value = getattr(sub, "text", None)
+            if isinstance(value, str) and value:
+                texts.append(value)
+    seen: set = set()
+    ordered: List[str] = []
+    for item in texts:
+        item = str(item).strip()
+        if item and item not in seen:
+            seen.add(item)
+            ordered.append(item)
+    return ordered
+
+
+def _select_parse_urls(text: str, quoted_texts: Iterable[str]) -> Tuple[List[str], bool]:
+    """选出用于解析的链接列表，并返回是否拿到"完整可用"的链接。
+
+    优先级：本消息完整链接 > 引用消息完整链接 > 疑似截断链接（仅在没有完整链接时保留，
+    供上层给出"链接不完整"提示）。返回值第二项为 False 时，列表里的链接都不可信。
+    """
+    good: List[str] = []
+    bad: List[str] = []
+    seen: set = set()
+
+    def _add(candidates: List[Tuple[str, bool]]) -> None:
+        for url, truncated in candidates:
+            if url in seen:
+                continue
+            seen.add(url)
+            (bad if truncated else good).append(url)
+
+    _add(_extract_url_candidates(text))
+    for quoted in quoted_texts:
+        _add(_extract_url_candidates(quoted))
+    if good:
+        return good, True
+    return bad, False
 
 
 async def _download_audio(url: str, timeout_sec: int = 60, max_size_mb: int = 10) -> Optional[str]:
@@ -1362,6 +1509,17 @@ def _profile_items_from_response(
     return []
 
 
+# 活动门禁状态 → /bk活动 列表里的中文标签（键与 GateValue 取值一一对应）
+_GATE_STATUS_TEXT: Dict[str, str] = {
+    "granted": "🟢 进行中，可领奖",
+    "already_claimed": "⚪ 已领取过",
+    "campaign_not_started": "⏳ 未开始",
+    "campaign_expired": "⏹ 已结束",
+    "campaign_disabled": "⏹ 已关闭",
+    "cooldown": "⏳ 冷却中",
+}
+
+
 @register(
     "astrbot_plugin_bktools",
     "jiuhunwl",
@@ -1398,6 +1556,12 @@ class BKToolsPlugin(Star):
         # 停止代次按群/私聊会话隔离，避免 A 群的停止命令中断 B 群任务。
         self._parse_cancel_generation: Dict[str, int] = {}
         self._parsing_lock: Dict[str, bool] = {}  # 解析锁，防止同一链接重复解析
+        # 活动发放（v1.7.0）：编排器惰性构建，配置变更后按指纹重建
+        self._campaign_mgr: Optional[CampaignManager] = None
+        self._campaign_fingerprint_saved: Optional[Tuple[Any, ...]] = None
+        self._campaign_lock = asyncio.Lock()
+        # 当次领取内有效的聊天联系方式（只用于问卷请求体，不落日志/状态文件）
+        self._claim_contact: Dict[str, Dict[str, str]] = {}
 
     def _runtime_config(self) -> Dict[str, Any]:
         return self._runtime_config_var.get() or self.config
@@ -1445,6 +1609,24 @@ class BKToolsPlugin(Star):
             if value:
                 return str(value).strip()
         return "unknown"
+
+    @staticmethod
+    def _event_nickname(event: AstrMessageEvent) -> str:
+        """尽力取发送者昵称（活动问卷 contact_source=chat_member 用）；取不到返回空。"""
+        for attr in ("sender_nickname", "nickname", "group_nickname", "sender_nick"):
+            value = getattr(event, attr, None)
+            if isinstance(value, str) and value.strip():
+                return value.strip()
+        try:
+            message_obj = getattr(event, "message_obj", None)
+            if message_obj is not None:
+                for attr in ("sender_nickname", "nickname", "group_nickname"):
+                    value = getattr(message_obj, attr, None)
+                    if isinstance(value, str) and value.strip():
+                        return value.strip()
+        except Exception:
+            pass
+        return ""
 
     def _scope_for_event(self, event: AstrMessageEvent) -> str:
         platform = self._event_platform(event)
@@ -1757,6 +1939,36 @@ class BKToolsPlugin(Star):
 
     def _http_reliability_cfg(self) -> Dict[str, Any]:
         return _cfg(self._runtime_config(), "http_reliability", default={}) or {}
+
+    def _open_api_http_kwargs(self) -> Dict[str, Any]:
+        """把 http / http_reliability 配置映射成 OpenApiClient 的入参名。
+
+        两个分组的键名与客户端入参名并不一致（退避单位是毫秒、熔断阈值叫法不同），
+        直接 **splat 会因未知关键字抛 TypeError 并导致整个活动模块静默不可用，
+        所以这里显式逐个映射、只输出客户端真正接受的键。
+        """
+        http_cfg = _cfg(self._runtime_config(), "http", default={}) or {}
+        reliability = self._http_reliability_cfg()
+
+        timeout_sec = int(http_cfg.get("timeout_sec", 45) or 45)
+        user_agent = str(http_cfg.get("user_agent") or "").strip()[:512]
+
+        retry_count = int(reliability.get("retry_count", 2) or 0)
+        retry_backoff_ms = int(reliability.get("retry_backoff_ms", 500) or 0)
+        circuit_threshold = int(reliability.get("circuit_failure_threshold", 5) or 1)
+        circuit_recovery_sec = int(reliability.get("circuit_recovery_sec", 60) or 60)
+
+        kwargs: Dict[str, Any] = {
+            "timeout_sec": max(1, min(timeout_sec, 600)),
+            "retry_count": max(0, min(retry_count, 10)),
+            "retry_backoff_sec": max(0.0, retry_backoff_ms / 1000.0),
+            "circuit_threshold": max(1, min(circuit_threshold, 100)),
+            "circuit_recovery_sec": max(1, min(circuit_recovery_sec, 3600)),
+        }
+        # 用户未配置 UA 时交给客户端默认值，避免空串覆盖
+        if user_agent:
+            kwargs["user_agent"] = user_agent
+        return kwargs
 
     def _send_key(self, label: str, payload: Dict[str, Any]) -> str:
         raw = json.dumps(payload, ensure_ascii=False, sort_keys=True, default=str)
@@ -3480,6 +3692,7 @@ class BKToolsPlugin(Star):
             f"活动解析任务：{active}\n"
             f"任务状态：{state_text}\n"
             f"接口熔断：{open_circuits}\n"
+            f"活动发放：{self._open_api_status_text()}\n"
             f"HTTP 会话：{'已连接' if self._http_client.session and not self._http_client.session.closed else '未建立'}\n"
             f"去重缓存：{len(self._dedup_cache)}\n"
             f"点歌缓存：{len(self._netease_pick_cache)}\n"
@@ -3532,6 +3745,22 @@ class BKToolsPlugin(Star):
         if alist_cfg.get("enable"):
             alist_ok = all(alist_cfg.get(key) for key in ("url", "username", "password"))
             checks.append(f"{'✅' if alist_ok else '❌'} Alist：{'配置完整' if alist_ok else '缺少地址或账号密码'}")
+        open_api_cfg = self._open_api_cfg()
+        if open_api_cfg.get("enabled"):
+            api_key = str(open_api_cfg.get("api_key") or "").strip()
+            has_key = bool(api_key) and _SENSITIVE_REDACTED_KEY_RE.search(api_key) is None
+            checks.append(
+                "✅ 开放 API：已启用，接口 Key 已配置"
+                if has_key
+                else "❌ 开放 API：已启用，但接口 Key 为空或仍是脱敏值"
+            )
+        else:
+            checks.append("⚠️ 开放 API：未启用，/bk领奖 活动发放不可用")
+        campaigns_raw = self._campaigns_raw()
+        if campaigns_raw:
+            checks.append(f"✅ 活动配置：共 {len(campaigns_raw)} 个活动")
+        else:
+            checks.append("⚠️ 活动配置：未配置任何活动（campaigns 为空）")
         await event.send(event.plain_result("【BKtools 诊断】\n" + "\n".join(checks)))
 
     @filter.command("bk帮助")
@@ -3546,6 +3775,8 @@ class BKToolsPlugin(Star):
                 "· /bk网易云 <关键词> — 仅网易云搜索（需配置搜索接口）\n"
                 "· /bk点歌 <序号> — 选择最近一次网易云搜索结果\n"
                 "· /bk音乐 <音乐分享链接> — QQ/汽水/酷我/网易等链接解析（无搜索）\n"
+                "· /bk领奖 — 领取已配置的活动奖励（需先完成对应任务）\n"
+                "· /bk开放Key、/bk活动 — 校验开放 API Key、查看活动配置（管理员）\n"
                 "· /bk状态 — 查看当前群有效配置与任务状态（管理员）\n"
                 "· /bk诊断 — 检查接口、依赖和安全防护（管理员）\n"
                 "· /bk版本 — 查看当前版本和更新仓库\n"
@@ -3670,6 +3901,378 @@ class BKToolsPlugin(Star):
         except Exception as e:
             await event.send(event.plain_result(f"已停止当前会话解析，但清理缓存失败: {str(e)}"))
 
+    # ============================================================= 活动发放（v1.7.0）
+    #
+    # 🔴 核心边界：插件只**生成并发放** CDK，绝不代兑——开放 Key 的 owner 是
+    # 持有账号，代兑会把奖励发到管理员账号。
+    # 双门禁：插件 open_api.enabled（默认关）+ 平台 systemsettings open_api.enabled，
+    # 任一关闭即整体停用；发放链路失败一律 fail-closed，网络/结构异常按「服务繁忙」
+    # 收敛，绝不放行。联系方式只进问卷请求体，不落日志与状态文件。
+
+    def _open_api_cfg(self) -> Dict[str, Any]:
+        return _cfg(self._runtime_config(), "open_api", default={}) or {}
+
+    def _campaigns_raw(self) -> List[Dict[str, Any]]:
+        # 走运行时配置（与其他配置节一致），这样单群覆盖里的 campaigns 才会生效；
+        # 直接读 self.config 会绕过覆盖，导致群级活动配置被静默忽略。
+        raw = _cfg(self._runtime_config(), "campaigns", default=[])
+        return list(_plain_config_value(raw)) if isinstance(raw, list) else []
+
+    def _survey_providers_raw(self) -> List[Dict[str, Any]]:
+        raw = self._open_api_cfg().get("survey_providers")
+        return list(_plain_config_value(raw)) if isinstance(raw, list) else []
+
+    def _chat_claim_key(self, event: AstrMessageEvent) -> str:
+        """聊天维度的领取标识：运行时 scope + 群/会话 + 发送者。"""
+        return f"{self._runtime_scope()}:{self._event_group_id(event)}:{self._event_sender_id(event)}"
+
+    def _event_contact_map(self, event: AstrMessageEvent) -> Dict[str, str]:
+        """当前事件里能取到的聊天身份（供 contact_source=chat_member 的问卷用）。"""
+        nickname = self._event_nickname(event)
+        sender = self._event_sender_id(event)
+        return {
+            "nickname": nickname,
+            "nick": nickname,
+            "name": nickname,
+            "group_nickname": nickname,
+            "qq": sender,
+            "id": sender,
+            "sender_id": sender,
+        }
+
+    def _chat_member_contact_provider(self, chat_key: str, contact_field_id: str) -> str:
+        """chat_member_provider：按 contact_field_id 从当次领取的上下文取联系方式。"""
+        contact = self._claim_contact.get(chat_key) or {}
+        return str(contact.get(str(contact_field_id or "").strip()) or "").strip()
+
+    @staticmethod
+    def _state_file_path(raw: Any) -> str:
+        """状态文件路径：绝对/相对当前目录直接沿用，裸文件名落到插件 data 目录。"""
+        text = str(raw or "").strip()
+        if not text:
+            text = "campaign_state.json"
+        if os.path.isabs(text) or text.startswith(("./", "../")):
+            return text
+        return os.path.join("data", "plugin_data", "astrbot_plugin_bktools", text)
+
+    def _campaign_fingerprint(self) -> Tuple[Any, ...]:
+        """影响编排器构建的配置指纹；变化则下次调用时重建。
+
+        必须覆盖**构建期读到的每一项**：活动模板和问卷 provider 也在构建期
+        被 load_campaigns / build_survey_verifier 消费，漏掉它们会让「只改
+        活动列表」这类改动被静默忽略，得靠 /bk活动 重载 才能生效。
+        """
+        cfg = self._open_api_cfg()
+        return (
+            str(cfg.get("base_url") or "").strip(),
+            str(cfg.get("api_key") or "").strip(),
+            str(cfg.get("key_type") or "opka_").strip(),
+            bool(cfg.get("verify_tls", True)),
+            str(cfg.get("github_token") or "").strip(),
+            self._state_file_path(cfg.get("state_file")),
+            int(cfg.get("cooldown_sec", 0) or 0),
+            int(cfg.get("max_claims_per_chat_day", 0) or 0),
+            self._config_digest(self._survey_providers_raw()),
+            self._config_digest(self._campaigns_raw()),
+        )
+
+    @staticmethod
+    def _config_digest(items: List[Dict[str, Any]]) -> str:
+        """把配置列表转成稳定可比较的字符串（键排序，不可序列化对象走 default=str）。"""
+        return json.dumps(items, ensure_ascii=False, sort_keys=True, default=str)
+
+
+    def _campaign_build(self) -> Optional[str]:
+        """（重）构建编排器。返回 None = 成功；否则返回停用原因（fail-closed）。"""
+        cfg = self._open_api_cfg()
+        base_url = str(cfg.get("base_url") or "").strip()
+        api_key = str(cfg.get("api_key") or "").strip()
+        key_type = str(cfg.get("key_type") or "opka_").strip()
+        client: Optional[OpenApiClient] = None
+        try:
+            client = OpenApiClient(
+                base_url,
+                api_key,
+                key_type,
+                verify_tls=bool(cfg.get("verify_tls", True)),
+                runtime=self._runtime_manager,
+                trace_factory=_public_url_trace_config,
+                **self._open_api_http_kwargs(),
+            )
+        except (TypeError, ValueError) as ex:
+            logger.warning("活动发放不可用（配置无效）: %s", ex)
+            return "开放 API 配置无效（base_url / api_key 缺失或格式不对）"
+        if not client.can_generate:
+            return "当前开放 Key 为普通用户 Key（opk_），没有发奖权限，请配置管理员作用域 Key（opka_）"
+
+        verifiers: Dict[str, _sa.SurveyVerifier] = {}
+        providers = self._survey_providers_raw()
+        if providers:
+            for provider_cfg in providers:
+                provider_type = str(provider_cfg.get("type") or "").strip().lower()
+                verifier = _sa.build_survey_verifier(provider_cfg)
+                if verifier is None:
+                    # 显式配置的 provider 构建失败不能静默跳过——否则会退化成
+                    # 「问卷不校验也照样发奖」，属 fail-open，必须整体停用。
+                    logger.error("问卷 provider 构建失败，活动发放整体停用: type=%s", provider_type)
+                    return f"问卷 provider 配置无效（type={provider_type or '空'}）"
+                verifiers[provider_type] = verifier
+        else:
+            # 无 provider 配置：只要活动开启问卷校验就整体停用，绝不静默跳过校验
+            if any((item.get("survey") or {}).get("enabled") for item in self._campaigns_raw()):
+                return "有活动开启了问卷校验但未配置 open_api.survey_providers"
+
+        reliability = self._http_reliability_cfg()
+        timeout_sec = int(reliability.get("timeout_sec", 30) or 30)
+        try:
+            star_verifier = GitHubStarVerifier(
+                str(cfg.get("github_token") or ""),
+                timeout_sec=max(5, min(timeout_sec, 60)),
+            )
+            state_store = CampaignStateStore(self._state_file_path(cfg.get("state_file")))
+            manager = CampaignManager(
+                client=client,
+                state_store=state_store,
+                star_verifier=star_verifier,
+                survey_verifiers=verifiers,
+                chat_member_provider=self._chat_member_contact_provider,
+                cooldown_sec=int(cfg.get("cooldown_sec", 0) or 0),
+                max_claims_per_chat_day=int(cfg.get("max_claims_per_chat_day", 0) or 0),
+            )
+        except (TypeError, ValueError) as ex:
+            logger.warning("活动发放不可用（构建失败）: %s", ex)
+            return "活动发放初始化失败"
+        manager.load_campaigns(self._campaigns_raw())
+        self._campaign_mgr = manager
+        self._campaign_fingerprint_saved = self._campaign_fingerprint()
+        logger.info("活动发放已就绪: 活动 %d 个，问卷 provider %d 个", len(manager.campaigns()), len(verifiers))
+        return None
+
+    async def _campaign_ensure(self, *, force: bool = False) -> Tuple[Optional[CampaignManager], Optional[str]]:
+        """惰性构建/复用编排器，返回 (manager, 停用原因)。
+
+        注意方法名不能叫 `_campaign_mgr`：`__init__` 里的同名**实例属性**存的是
+        编排器实例，会遮蔽类方法，导致 `await self._campaign_mgr()` 直接
+        `TypeError: 'NoneType' object is not callable`（v1.7.0 遗留 bug）。
+
+        force=True 用于管理命令的「强制重建」：直接丢弃旧实例再按当前配置重建，
+        不比对指纹，这样临时改动配置后 /bk活动 能立刻看到效果。
+        """
+        if not _CAMPAIGN_READY:
+            return None, "可选模块缺失，活动发放功能停用（请用完整插件包重新安装）"
+        async with self._campaign_lock:
+            if force:
+                self._campaign_mgr = None
+                self._campaign_fingerprint_saved = None
+            fingerprint = self._campaign_fingerprint()
+            if self._campaign_mgr is not None and self._campaign_fingerprint_saved == fingerprint:
+                return self._campaign_mgr, None
+            reason = self._campaign_build()
+            if reason:
+                return None, reason
+            return self._campaign_mgr, None
+
+    async def _open_api_test(self) -> Tuple[bool, str]:
+        """连通性 + 读 scope 校验：GET /open-api/account。"""
+        if not _CAMPAIGN_READY:
+            return False, "可选模块缺失，活动发放功能停用（请用完整插件包重新安装）"
+        cfg = self._open_api_cfg()
+        base_url = str(cfg.get("base_url") or "").strip()
+        api_key = str(cfg.get("api_key") or "").strip()
+        key_type = str(cfg.get("key_type") or "opka_").strip()
+        if not (base_url and api_key):
+            return False, "open_api.base_url / api_key 未配置"
+        client = OpenApiClient(
+            base_url, api_key, key_type, verify_tls=bool(cfg.get("verify_tls", True)),
+            runtime=self._runtime_manager, trace_factory=_public_url_trace_config,
+            **self._open_api_http_kwargs(),
+        )
+        try:
+            data = await client.get_account()
+            if not isinstance(data, dict) or not data:
+                return False, "接口响应为空"
+            enabled = data.get("openApiEnabled")
+            username = str(data.get("username") or data.get("nickname") or "-")
+            # bool 字面量 True/False 显示为「开/关」；None 表示上游未返回该字段
+            if enabled is True:
+                switch = "已开启"
+            elif enabled is False:
+                switch = "已关闭（未开启时任何调用都会被拒）"
+            else:
+                switch = "未返回"
+            return True, f"连通正常，账号 {username}，平台开放 API 开关：{switch}"
+        except OpenApiError as ex:
+            extra = ""
+            if getattr(ex, "code", "") == "openapi.ip_forbidden" and getattr(ex, "client_ip", ""):
+                extra = f"（出口 IP {ex.client_ip}，请把它加进开放 Key 白名单）"
+            return False, f"{ex.describe()}{extra}"
+        except (TypeError, ValueError) as ex:
+            return False, f"配置异常: {ex}"
+        finally:
+            await client.close()
+
+    # ------------------------------------------------------------- 命令
+
+    @filter.command("bk领奖")
+    @_event_scoped("campaign")
+    async def cmd_claim(self, event: AstrMessageEvent):
+        """活动领取 CDK"""
+        await self._run_claim(event, self._cmd_arg(event, "bk领奖"))
+
+    @filter.command("bk领奖码")
+    @_event_scoped("campaign")
+    async def cmd_claim_alias(self, event: AstrMessageEvent):
+        """活动领取 CDK（简写）"""
+        await self._run_claim(event, self._cmd_arg(event, "bk领奖码"))
+
+    async def _run_claim(self, event: AstrMessageEvent, arg: str) -> None:
+        manager, reason = await self._campaign_ensure()
+        if manager is None:
+            await event.send(event.plain_result(f"活动领奖暂不可用：{reason or '未配置'}"))
+            return
+        parts = re.split(r"\s+", str(arg or "").strip())
+        campaign_id = parts[0] if parts else ""
+        login = parts[1] if len(parts) > 1 else ""
+        if not campaign_id:
+            live = [cid for cid, item in manager.campaigns().items() if item.enabled]
+            if len(live) == 1:
+                campaign_id = live[0]
+            else:
+                await event.send(
+                    event.plain_result(
+                        "用法：/bk领奖 <活动ID> <GitHub用户名>\n"
+                        + (f"可用活动：{'、'.join(live)}" if live else "当前没有进行中的活动，用 /bk活动 列表 查看详情。")
+                    )
+                )
+                return
+        key = self._chat_claim_key(event)
+        self._claim_contact[key] = self._event_contact_map(event)
+        try:
+            result = await manager.claim(
+                key,
+                campaign_id,
+                login,
+                chat_ref=f"{self._runtime_scope()}:{self._event_group_id(event)}",
+            )
+        finally:
+            self._claim_contact.pop(key, None)
+        definition = manager.get(result.campaign_id) or manager.get(campaign_id)
+        if result.result is ClaimResult.GRANTED:
+            url = str(self._open_api_cfg().get("redeem_url") or "").strip()
+            text = (
+                "🎉 领取成功，下面是你的专属兑换码：\n"
+                f"CDK：{result.code}\n"
+                + (f"兑换入口：{url}\n" if url else "登录平台后进入「兑换码」页面自行兑换。\n")
+                + "兑换码会自动绑定到你的平台账号，请自己登录后兑换，不要外传。"
+            )
+        else:
+            text = _CLAIM_USER_TEXT.get(result.result, "服务暂时繁忙，请稍后再试。")
+            if result.result is ClaimResult.STAR_NOT_STARRED and definition:
+                text += f"请先去 star {definition.star.owner}/{definition.star.repo} 再来领奖。"
+        if result.detail:
+            logger.info(
+                "活动领奖: campaign=%s chat=%s result=%s %s",
+                result.campaign_id, key, result.result.value, result.detail,
+            )
+        await event.send(event.plain_result(text))
+
+    async def _open_api_status_text(self) -> str:
+        """开放 API 状态（Key 全程只出掩码）。"""
+        if not _CAMPAIGN_READY:
+            return "【开放 API 状态】\n可选模块缺失，活动发放功能停用（短视频/音乐解析不受影响）。\n请用完整插件包重新安装后重试。"
+        cfg = self._open_api_cfg()
+        enabled = bool(cfg.get("enabled", False))
+        base_url = str(cfg.get("base_url") or "").strip()
+        api_key = str(cfg.get("api_key") or "").strip()
+        key_type = str(cfg.get("key_type") or "opka_").strip()
+        key_text = _oca.mask_key(api_key)
+        if api_key and not api_key.startswith(key_type):
+            key_text += "（前缀与 key_type 不一致）"
+        if api_key and base_url and not base_url.startswith("https://"):
+            key_text += "（接口地址非 https，建议改用 https）"
+        manager, reason = await self._campaign_ensure()
+        lines = [
+            "【开放 API 状态】",
+            f"功能开关：{'开启' if enabled else '关闭（open_api.enabled=false，领奖不可用）'}",
+            f"接口地址：{base_url or '未配置'}",
+            f"开放 Key：{key_text if key_text else '未配置'}",
+            f"Key 作用域：{key_type}{'（管理员作用域）' if key_type == KEY_TYPE_ADMIN else '（普通用户，无发奖权限）'}",
+            f"证书校验：{'开启' if cfg.get('verify_tls', True) else '关闭'}",
+            f"GitHub Token：{'已配置' if str(cfg.get('github_token') or '') else '未配置（star 校验走匿名配额 60 次/小时）'}",
+            f"状态文件：{self._state_file_path(cfg.get('state_file'))}",
+            f"兑换入口：{str(cfg.get('redeem_url') or '') or '未配置（领取成功时不附链接）'}",
+        ]
+        if manager is not None:
+            lines.append(f"活动配置：{len(manager.campaigns())} 个已加载")
+        else:
+            lines.append(f"活动配置：未就绪（{reason or '未知原因'}）")
+        return "\n".join(lines)
+
+    @filter.command("bk开放Key")
+    @_event_scoped("campaign")
+    @_management_only
+    async def cmd_openkey(self, event: AstrMessageEvent):
+        """开放 API 状态 / 连通性测试（管理员）"""
+        await self._openkey_action(event, self._cmd_arg(event, "bk开放Key", "bk开放key"))
+
+    @filter.command("bk开放key")
+    @_event_scoped("campaign")
+    @_management_only
+    async def cmd_openkey_alias(self, event: AstrMessageEvent):
+        """开放 API 状态 / 连通性测试（管理员，小写）"""
+        await self._openkey_action(event, self._cmd_arg(event, "bk开放key", "bk开放Key"))
+
+    async def _openkey_action(self, event: AstrMessageEvent, arg: str) -> None:
+        action = str(arg or "").strip()
+        if action in ("测试", "test", "连通", "check"):
+            await event.send(event.plain_result("正在测试开放 API 连通性…"))
+            ok, message = await self._open_api_test()
+            await event.send(event.plain_result(f"{'✅' if ok else '❌'} 开放 API 测试：{message}"))
+            return
+        await event.send(event.plain_result(await self._open_api_status_text()))
+
+    @filter.command("bk活动")
+    @_event_scoped("campaign")
+    @_management_only
+    async def cmd_campaign(self, event: AstrMessageEvent):
+        """活动列表 / 重载配置（管理员）"""
+        await self._campaign_action(event, self._cmd_arg(event, "bk活动"))
+
+    async def _campaign_action(self, event: AstrMessageEvent, arg: str) -> None:
+        action = str(arg or "").strip()
+        if action in ("重载", "reload"):
+            manager, reason = await self._campaign_ensure(force=True)
+            if manager is None:
+                await event.send(event.plain_result(f"❌ 重载失败：{reason or '未知原因'}"))
+                return
+            await event.send(
+                event.plain_result(f"✅ 活动配置已重载，当前 {len(manager.campaigns())} 个活动。")
+            )
+            return
+        manager, reason = await self._campaign_ensure()
+        if manager is None:
+            await event.send(event.plain_result(f"活动发放未就绪：{reason or '未知原因'}"))
+            return
+        campaigns = manager.campaigns()
+        if not campaigns:
+            await event.send(event.plain_result("当前没有配置活动（campaigns 为空）。"))
+            return
+        lines = ["【活动列表】"]
+        now = time.time()
+        for cid, definition in sorted(campaigns.items()):
+            gate = manager.check_gate(definition, now_ts=now)
+            status = _GATE_STATUS_TEXT.get(gate.value, "⚪ 已关闭")
+            gates: List[str] = []
+            if definition.star.enabled:
+                gates.append(f"star {definition.star.owner}/{definition.star.repo}")
+            if definition.survey.enabled:
+                gates.append(f"问卷 {definition.survey.provider or '未指定'}")
+            line = f"{cid} — {definition.name or cid}：{status}"
+            if gates:
+                line += "（" + "、".join(gates) + "）"
+            lines.append(line)
+        await event.send(event.plain_result("\n".join(lines)))
+
     @filter.event_message_type(EventMessageType.ALL)
     @_event_scoped(silent=True)
     async def on_auto(self, event: AstrMessageEvent):
@@ -3684,12 +4287,24 @@ class BKToolsPlugin(Star):
             picked = await self._netease_pick_by_index(event, int(pure))
             if picked:
                 return
-        urls = _extract_urls(text)
+        # 引用/回复消息：message_str 可能为空，或被客户端截断成 "https://v.douyin.com/WM5..."；
+        # 被引用消息的完整原文保存在 Reply 组件上，作为候选来源一并参与选链
+        urls, has_complete = _select_parse_urls(text, _quoted_message_texts(event))
         if not urls:
             return
         # 拦截命令消息，避免命令处理器和自动触发重复执行
         text_stripped = text.strip()
         if text_stripped.startswith("/bk") or text_stripped.startswith("bk"):
+            return
+        if not has_complete:
+            # 只剩被截断的残链，请求接口必然失败，给出提示而不是白白消耗一次解析
+            logger.warning("自动解析跳过截断链接（引用长文本被客户端截断）: %s", urls)
+            await event.send(
+                event.plain_result(
+                    "链接不完整：客户端引用长文本时会截断内容，导致解析失败。\n"
+                    "请直接发送完整链接，或复制整段分享文案后单独发送。"
+                )
+            )
             return
 
         resolved_urls = []

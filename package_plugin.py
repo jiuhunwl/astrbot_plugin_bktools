@@ -15,6 +15,10 @@ MANUAL_REL = os.path.join("manual_upload", ROOT_NAME)
 PLUGIN_FILES = (
     "bktools_runtime.py",
     "bktools_updater.py",
+    "campaign_manager.py",
+    "github_star.py",
+    "open_api_client.py",
+    "survey_adapter.py",
     "CHANGELOG.md",
     "README.md",
     "_conf_schema.json",

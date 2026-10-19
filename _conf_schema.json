@@ -96,57 +96,121 @@
                   "auto_short_video": {
                     "description": "自动解析短视频",
                     "type": "string",
-                    "options": ["inherit", "enable", "disable"],
-                    "labels": ["继承全局", "强制开启", "强制关闭"],
+                    "options": [
+                      "inherit",
+                      "enable",
+                      "disable"
+                    ],
+                    "labels": [
+                      "继承全局",
+                      "强制开启",
+                      "强制关闭"
+                    ],
                     "default": "inherit"
                   },
                   "auto_douyin_profile": {
                     "description": "自动解析抖音主页",
                     "type": "string",
-                    "options": ["inherit", "enable", "disable"],
-                    "labels": ["继承全局", "强制开启", "强制关闭"],
+                    "options": [
+                      "inherit",
+                      "enable",
+                      "disable"
+                    ],
+                    "labels": [
+                      "继承全局",
+                      "强制开启",
+                      "强制关闭"
+                    ],
                     "default": "inherit"
                   },
                   "auto_music_link": {
                     "description": "自动解析音乐链接",
                     "type": "string",
-                    "options": ["inherit", "enable", "disable"],
-                    "labels": ["继承全局", "强制开启", "强制关闭"],
+                    "options": [
+                      "inherit",
+                      "enable",
+                      "disable"
+                    ],
+                    "labels": [
+                      "继承全局",
+                      "强制开启",
+                      "强制关闭"
+                    ],
                     "default": "inherit"
                   },
                   "pack_forward": {
                     "description": "合并转发",
                     "type": "string",
-                    "options": ["inherit", "enable", "disable"],
-                    "labels": ["继承全局", "强制开启", "强制关闭"],
+                    "options": [
+                      "inherit",
+                      "enable",
+                      "disable"
+                    ],
+                    "labels": [
+                      "继承全局",
+                      "强制开启",
+                      "强制关闭"
+                    ],
                     "default": "inherit"
                   },
                   "opening_enable": {
                     "description": "“正在解析”提示",
                     "type": "string",
-                    "options": ["inherit", "enable", "disable"],
-                    "labels": ["继承全局", "强制开启", "强制关闭"],
+                    "options": [
+                      "inherit",
+                      "enable",
+                      "disable"
+                    ],
+                    "labels": [
+                      "继承全局",
+                      "强制开启",
+                      "强制关闭"
+                    ],
                     "default": "inherit"
                   },
                   "send_voice_message": {
                     "description": "音乐语音消息",
                     "type": "string",
-                    "options": ["inherit", "enable", "disable"],
-                    "labels": ["继承全局", "强制开启", "强制关闭"],
+                    "options": [
+                      "inherit",
+                      "enable",
+                      "disable"
+                    ],
+                    "labels": [
+                      "继承全局",
+                      "强制开启",
+                      "强制关闭"
+                    ],
                     "default": "inherit"
                   },
                   "force_link_enabled": {
                     "description": "视频始终发送直链",
                     "type": "string",
-                    "options": ["inherit", "enable", "disable"],
-                    "labels": ["继承全局", "强制开启", "强制关闭"],
+                    "options": [
+                      "inherit",
+                      "enable",
+                      "disable"
+                    ],
+                    "labels": [
+                      "继承全局",
+                      "强制开启",
+                      "强制关闭"
+                    ],
                     "default": "inherit"
                   },
                   "direct_json_enabled": {
                     "description": "大批量内容直接发 JSON",
                     "type": "string",
-                    "options": ["inherit", "enable", "disable"],
-                    "labels": ["继承全局", "强制开启", "强制关闭"],
+                    "options": [
+                      "inherit",
+                      "enable",
+                      "disable"
+                    ],
+                    "labels": [
+                      "继承全局",
+                      "强制开启",
+                      "强制关闭"
+                    ],
                     "default": "inherit"
                   }
                 }
@@ -174,8 +238,16 @@
       "management_permission": {
         "description": "管理命令权限",
         "type": "string",
-        "options": ["admin_only", "allowlist_only", "everyone"],
-        "labels": ["群主/群管理员或授权用户", "仅授权用户列表", "所有成员（不推荐）"],
+        "options": [
+          "admin_only",
+          "allowlist_only",
+          "everyone"
+        ],
+        "labels": [
+          "群主/群管理员或授权用户",
+          "仅授权用户列表",
+          "所有成员（不推荐）"
+        ],
         "default": "admin_only",
         "hint": "控制 /bk停止解析、/bk清理缓存、/bk状态 和 /bk诊断。",
         "obvious_hint": true
@@ -1417,25 +1489,41 @@
         "description": "接口重试次数",
         "type": "int",
         "default": 2,
-        "slider": {"min": 0, "max": 5, "step": 1}
+        "slider": {
+          "min": 0,
+          "max": 5,
+          "step": 1
+        }
       },
       "retry_backoff_ms": {
         "description": "重试初始退避（毫秒）",
         "type": "int",
         "default": 500,
-        "slider": {"min": 0, "max": 5000, "step": 100}
+        "slider": {
+          "min": 0,
+          "max": 5000,
+          "step": 100
+        }
       },
       "circuit_failure_threshold": {
         "description": "熔断失败阈值",
         "type": "int",
         "default": 5,
-        "slider": {"min": 1, "max": 20, "step": 1}
+        "slider": {
+          "min": 1,
+          "max": 20,
+          "step": 1
+        }
       },
       "circuit_recovery_sec": {
         "description": "熔断恢复等待（秒）",
         "type": "int",
         "default": 60,
-        "slider": {"min": 5, "max": 600, "step": 5}
+        "slider": {
+          "min": 5,
+          "max": 600,
+          "step": 5
+        }
       }
     }
   },
@@ -1449,13 +1537,21 @@
         "type": "int",
         "default": 2,
         "hint": "仅对适配器未连接/断连等确定未送达的错误重试；平台已明确拒绝或响应超时均不重试相同内容。",
-        "slider": {"min": 0, "max": 5, "step": 1}
+        "slider": {
+          "min": 0,
+          "max": 5,
+          "step": 1
+        }
       },
       "retry_backoff_ms": {
         "description": "重试退避（毫秒）",
         "type": "int",
         "default": 800,
-        "slider": {"min": 0, "max": 5000, "step": 100}
+        "slider": {
+          "min": 0,
+          "max": 5000,
+          "step": 100
+        }
       },
       "timeout_fallback": {
         "description": "超时兜底策略",
@@ -1468,7 +1564,11 @@
         "type": "int",
         "default": 5,
         "hint": "超时后先等待该时长再发送兜底，给平台追送结果的机会，降低重复感。",
-        "slider": {"min": 0, "max": 60, "step": 1}
+        "slider": {
+          "min": 0,
+          "max": 60,
+          "step": 1
+        }
       },
       "release_claim_on_failure": {
         "description": "发送完全失败后释放去重标记",
@@ -1509,14 +1609,22 @@
         "description": "长 JSON 最大分片节点数",
         "type": "int",
         "default": 100,
-        "slider": {"min": 10, "max": 200, "step": 10},
+        "slider": {
+          "min": 10,
+          "max": 200,
+          "step": 10
+        },
         "hint": "插件会自动调整每个节点的文本长度，并将所有分片放在同一条合并转发中。"
       },
       "runtime_cache_max_entries": {
         "description": "运行时缓存最大条目数",
         "type": "int",
         "default": 1000,
-        "slider": {"min": 100, "max": 10000, "step": 100}
+        "slider": {
+          "min": 100,
+          "max": 10000,
+          "step": 100
+        }
       }
     }
   },
@@ -1535,7 +1643,11 @@
         "description": "更新包最大体积（MB）",
         "type": "int",
         "default": 20,
-        "slider": {"min": 1, "max": 100, "step": 1}
+        "slider": {
+          "min": 1,
+          "max": 100,
+          "step": 1
+        }
       }
     }
   },
@@ -1564,6 +1676,384 @@
           "step": 100
         },
         "hint": "限制日志长度，避免完整响应刷屏或泄露过多数据。"
+      }
+    }
+  },
+  "campaigns": {
+    "description": "🎯 活动模板",
+    "type": "template_list",
+    "hint": "每个活动对应一段门禁（star / 问卷）与一个奖励类型。仅在 open_api.enabled 为开时生效。",
+    "templates": {
+      "campaign": {
+        "name": "添加活动",
+        "hint": "填写活动 ID 与奖励类型代码后即可在群里用 /bk领奖 <活动ID> 领取。",
+        "display_item": "id",
+        "items": {
+          "id": {
+            "description": "活动 ID",
+            "type": "string",
+            "default": "",
+            "hint": "唯一标识，只能包含字母、数字、下划线和连字符。用户用 /bk领奖 <活动ID> 领取。",
+            "obvious_hint": true
+          },
+          "name": {
+            "description": "活动名称",
+            "type": "string",
+            "default": "",
+            "hint": "显示名称，可留空（留空时按活动 ID 展示）。"
+          },
+          "enabled": {
+            "description": "启用该活动",
+            "type": "bool",
+            "default": true,
+            "hint": "关闭后不再发放，用户会看到「活动未开始/已结束」提示。"
+          },
+          "type_code": {
+            "description": "奖励类型代码",
+            "type": "string",
+            "default": "",
+            "hint": "平台兑换码类型代码（如 NEWBIE）。必填，留空该活动会被跳过。",
+            "obvious_hint": true
+          },
+          "start_at": {
+            "description": "开始时间",
+            "type": "string",
+            "default": "",
+            "hint": "ISO 8601，例如 2026-11-01T00:00:00；留空表示立即开始。"
+          },
+          "end_at": {
+            "description": "结束时间",
+            "type": "string",
+            "default": "",
+            "hint": "ISO 8601；留空表示长期有效。"
+          },
+          "per_user_limit": {
+            "description": "每用户次数",
+            "type": "int",
+            "default": 1,
+            "slider": {
+              "min": 0,
+              "max": 99,
+              "step": 1
+            },
+            "hint": "平台上限，最终发放次数取平台与本地值中较小的一个。"
+          },
+          "per_ip_limit": {
+            "description": "每 IP 次数",
+            "type": "int",
+            "default": 0,
+            "slider": {
+              "min": 0,
+              "max": 999,
+              "step": 1
+            },
+            "hint": "0 表示不限制。"
+          },
+          "reward_notice": {
+            "description": "领奖提示文案",
+            "type": "string",
+            "default": "",
+            "hint": "可选，发放成功后追加显示的说明。"
+          },
+          "star": {
+            "description": "Star 条件",
+            "type": "dict",
+            "default": {},
+            "hint": "填写 owner / repo 后要求用户在指定仓库已有 star。owner/repo 为空表示不做 star 校验。"
+          },
+          "survey": {
+            "description": "问卷条件",
+            "type": "dict",
+            "default": {},
+            "hint": "填写 provider / form_id 后要求用户提交过对应问卷。开启时必须先在 open_api.survey_providers 配置同名 provider。"
+          }
+        }
+      }
+    }
+  },
+  "open_api": {
+    "description": "🎁 开放 API 活动发放",
+    "type": "object",
+    "hint": "对接 BugPk 平台开放 API 发放兑换码（CDK）。默认关闭；平台后台的开放 API 开关也必须为开，否则一律 fail-closed。",
+    "items": {
+      "enabled": {
+        "description": "启用活动发放",
+        "type": "bool",
+        "default": false,
+        "hint": "开启后 /bk领奖 才会真正发放奖励，/bk开放Key、/bk活动 才可用。"
+      },
+      "base_url": {
+        "description": "平台地址",
+        "type": "string",
+        "default": "",
+        "hint": "例如 https://api-new.bugpk.com，不要带结尾斜杠。",
+        "condition": {
+          "enabled": true
+        }
+      },
+      "api_key": {
+        "description": "开放 API Key",
+        "type": "string",
+        "default": "",
+        "hint": "需在平台后台创建。发奖必须使用管理员作用域 Key（opka_），普通用户 Key（opk_）只有读写自身数据的权限。",
+        "condition": {
+          "enabled": true
+        }
+      },
+      "key_type": {
+        "description": "Key 类型前缀",
+        "type": "string",
+        "default": "opka_",
+        "options": [
+          "opka_",
+          "opk_"
+        ],
+        "labels": [
+          "管理员作用域（opka_，可发奖）",
+          "普通用户（opk_，仅读写自身数据）"
+        ],
+        "hint": "按后台创建的 Key 前缀选择。",
+        "condition": {
+          "enabled": true
+        }
+      },
+      "verify_tls": {
+        "description": "校验 TLS 证书",
+        "type": "bool",
+        "default": true,
+        "hint": "本地自签证书调试时才关闭。",
+        "condition": {
+          "enabled": true
+        }
+      },
+      "github_token": {
+        "description": "GitHub Token",
+        "type": "string",
+        "default": "",
+        "hint": "用于校验 star 条件。只读即可，建议用 fine-grained token 并只授权目标仓库的 metadata 读权限；留空时 star 条件一律不通过。",
+        "condition": {
+          "enabled": true
+        }
+      },
+      "state_file": {
+        "description": "参与记录文件",
+        "type": "string",
+        "default": "campaign_state.json",
+        "hint": "本地领取记录，只增不删（用于本地防刷与审计）。填裸文件名时落在插件 data 目录；填绝对或 ./ ../ 相对路径则按原样使用。",
+        "condition": {
+          "enabled": true
+        }
+      },
+      "cooldown_sec": {
+        "description": "同会话领取冷却（秒）",
+        "type": "int",
+        "default": 0,
+        "slider": {
+          "min": 0,
+          "max": 86400,
+          "step": 1
+        },
+        "hint": "0 表示不启用冷却。",
+        "condition": {
+          "enabled": true
+        }
+      },
+      "max_claims_per_chat_day": {
+        "description": "同会话每日领取上限",
+        "type": "int",
+        "default": 0,
+        "slider": {
+          "min": 0,
+          "max": 999,
+          "step": 1
+        },
+        "hint": "0 表示不限制。",
+        "condition": {
+          "enabled": true
+        }
+      },
+      "redeem_url": {
+        "description": "兑换入口链接",
+        "type": "string",
+        "default": "",
+        "condition": {
+          "enabled": true
+        },
+        "hint": "选填：发放成功后附在提示里的兑换入口（例如 https://example.com/redeem）。留空则只提示兑换码本身。"
+      },
+      "survey_providers": {
+        "description": "问卷 provider",
+        "type": "template_list",
+        "hint": "有活动开启问卷校验时必须至少配置一条；未配置的 provider 会导致活动发放整体停用（fail-closed），不会跳过校验。",
+        "templates": {
+          "juanwang": {
+            "name": "添加卷王问卷",
+            "display_item": "base_url",
+            "items": {
+              "base_url": {
+                "description": "问卷服务地址",
+                "type": "string",
+                "default": "",
+                "hint": "例如 https://survey.example.com，不带结尾斜杠。",
+                "condition": {
+                  "enabled": true
+                }
+              },
+              "survey_id": {
+                "description": "问卷 ID",
+                "type": "string",
+                "default": "",
+                "condition": {
+                  "enabled": true
+                }
+              },
+              "contact_field_id": {
+                "description": "联系方式字段 ID",
+                "type": "string",
+                "default": "",
+                "hint": "必填：问卷中用于比对联系方式的题目标识。留空会导致该 provider 构建失败，进而整体停用活动发放（fail-closed），不会跳过校验。",
+                "condition": {
+                  "enabled": true
+                }
+              },
+              "api_prefix": {
+                "description": "接口前缀",
+                "type": "string",
+                "default": "/api",
+                "condition": {
+                  "enabled": true
+                }
+              },
+              "query_mode": {
+                "description": "查询模式",
+                "type": "string",
+                "default": "answer",
+                "hint": "answer 按作答记录查询。",
+                "condition": {
+                  "enabled": true
+                }
+              },
+              "timeout_sec": {
+                "description": "请求超时（秒）",
+                "type": "int",
+                "default": 15,
+                "slider": {
+                  "min": 5,
+                  "max": 60,
+                  "step": 1
+                },
+                "condition": {
+                  "enabled": true
+                }
+              }
+            }
+          },
+          "http_generic": {
+            "name": "添加自定义 HTTP 问卷",
+            "hint": "对接任意返回成功标志的 HTTP 接口。",
+            "display_item": "endpoint",
+            "items": {
+              "endpoint": {
+                "description": "校验接口地址",
+                "type": "string",
+                "default": "",
+                "hint": "接收问卷提交结果并返回成功标志的 HTTP 接口。",
+                "condition": {
+                  "enabled": true
+                }
+              },
+              "method": {
+                "description": "请求方法",
+                "type": "string",
+                "default": "POST",
+                "condition": {
+                  "enabled": true
+                }
+              },
+              "auth_type": {
+                "description": "鉴权方式",
+                "type": "string",
+                "default": "none",
+                "hint": "none / header / query。",
+                "condition": {
+                  "enabled": true
+                }
+              },
+              "credential": {
+                "description": "凭据",
+                "type": "string",
+                "default": "",
+                "hint": "鉴权方式非 none 时填写。",
+                "condition": {
+                  "enabled": true
+                }
+              },
+              "auth_header": {
+                "description": "鉴权头名",
+                "type": "string",
+                "default": "X-Api-Key",
+                "condition": {
+                  "enabled": true
+                }
+              },
+              "form_param": {
+                "description": "问卷 ID 参数名",
+                "type": "string",
+                "default": "form_id",
+                "condition": {
+                  "enabled": true
+                }
+              },
+              "contact_field": {
+                "description": "联系方式参数名",
+                "type": "string",
+                "default": "contact",
+                "condition": {
+                  "enabled": true
+                }
+              },
+              "extra_params_json": {
+                "description": "附加参数（JSON）",
+                "type": "string",
+                "default": "",
+                "hint": "例如 {\"source\": \"astrbot\"}，非法 JSON 会被忽略。",
+                "condition": {
+                  "enabled": true
+                }
+              },
+              "success_field": {
+                "description": "成功判定字段",
+                "type": "string",
+                "default": "",
+                "hint": "为空表示接口 HTTP 2xx 即视为通过。",
+                "condition": {
+                  "enabled": true
+                }
+              },
+              "success_value": {
+                "description": "成功判定值",
+                "type": "string",
+                "default": "true",
+                "condition": {
+                  "enabled": true
+                }
+              },
+              "timeout_sec": {
+                "description": "请求超时（秒）",
+                "type": "int",
+                "default": 15,
+                "slider": {
+                  "min": 5,
+                  "max": 60,
+                  "step": 1
+                },
+                "condition": {
+                  "enabled": true
+                }
+              }
+            }
+          }
+        }
       }
     }
   }

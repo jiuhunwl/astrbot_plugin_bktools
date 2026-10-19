@@ -4,6 +4,58 @@
 
 格式参考 Keep a Changelog，并遵循语义化版本管理思路。
 
+## [v1.7.1] - 2026-10-19
+
+### Fixed
+
+- 修复 QQ 引用消息自动解析时传参残缺的问题（`{"url":["https://v.douyin.com/WM5"]}`）：客户端引用长文本会在约第 79 字符处截断并追加 `...`，插件 `_extract_urls` 把尾部的连续省略号当作「结尾标点」剥掉，于是把 `https://v.douyin.com/WM5` 这种残链当成完整链接送接口，解析必然失败
+
+### Changed
+
+- 自动解析的选链逻辑重写（`_select_parse_urls`）：现在会读取引用/回复消息段（Reply 组件）里**被引用消息的完整原文**（适配器通过 `get_msg` 拉取的全量文本）一并参与选链，完整链接优先于截断链接；用户自己发送的完整链接始终优先于引用内容
+- 尾部连续省略号（`...` / `…`）的链接会被判定为「疑似截断残链」；当只剩残链、没有任何完整链接时，不再白白请求接口，改为提示「链接不完整：请直接发送完整链接，或复制整段分享文案后单独发送」，并记录警告日志
+- 新增 `_quoted_message_texts`（按特征属性识别 Reply 组件，避免对 AstrBot 版本的硬依赖）与 `_extract_url_candidates`；`_extract_urls` 保留原签名作为兼容入口
+- 新增 `tests/test_quoted_link.py`（14 个用例）：直接发送分享文案回归、截断标记、引用原文优先、仅剩残链提示、去重、异常 `message_obj` 不抛错等
+
+### Fixed（可选模块缺文件不再拖垮整个插件）
+
+- 修复部署目录缺少 `campaign_manager` / `open_api_client` / `github_star` / `survey_adapter` 时报 `No module named 'campaign_manager'`、**整个插件加载失败**（短视频/音乐解析一起不可用）的问题：可选模块改为 fail-soft 导入，缺失时仅停用活动发放并记录警告，核心解析完全不受影响；`/bk领奖`、`/bk活动`、`/bk开放Key` 会给出「请用完整插件包重新安装」的明确提示
+- 修复 v1.7.0 遗留的 `self._campaign_mgr` **实例属性遮蔽同名方法**问题：`__init__` 里的编排器实例属性与惰性构建方法重名，导致 `/bk领奖`、`/bk活动` 一调用就抛 `TypeError: 'NoneType' object is not callable`；方法已更名为 `_campaign_ensure`（属性名不变），原测试只覆盖子模块、没走到这条链路所以未暴露
+- `package_plugin.py` 的打包清单补上 v1.7.0 的 4 个新模块，否则打出的 zip 装上必报缺模块
+
+## [v1.7.0] - 2026-10-15
+
+### Added
+
+- 开放 API 活动发放：新增 `open_api` 与 `campaigns` 两组配置。群内用 `/bk领奖 <活动ID>` 领取活动奖励；管理端用 `/bk开放Key`（校验接口 Key 连通性与权限）与 `/bk活动`（查看活动列表、`重载` 强制重建配置）
+- 双门禁：GitHub star 校验 + 问卷校验（卷王 / 自定义 HTTP 两种 provider），两个条件都通过才发奖
+- 本地防刷：同会话冷却（`cooldown_sec`）、每日领取上限（`max_claims_per_chat_day`）、按用户 / IP 次数限制；参与记录原子写入且只增不删
+- `/bk状态` 与 `/bk诊断` 增加活动发放就绪状态与开放 API Key 配置校验结果（可识别脱敏占位值）
+- 新增模块 `open_api_client.py`（开放 API 客户端）、`campaign_manager.py`（活动编排 + 本地状态存储）、`survey_adapter.py`（问卷校验适配）、`github_star.py`（star 校验），配套 `tests/test_openapi_campaign.py`
+
+### Changed
+
+- 活动条目用 `type_code`（兑换码类型代码，如 `NEWBIE`）指向奖励类型，不再要求填写数字 ID。旧配置里的 `type_id` 字段仍被识别（纯数字时按数字 ID 传给平台），无需改动即可平滑升级
+- `_conf_schema.json` 由 16 组配置扩展到 18 组（纯新增，原有分组未改动）
+
+### Fixed
+
+- 修复成功响应的 `code: 0` 被当成失败：原先 `int(payload.get("code") or -1)` 会把 0 变成 -1，导致所有成功的发奖调用被判失败并重试
+- 修复本地防刷时间戳解析失效：ISO 8601 时间串无法被 `%Y-%m-%d %H:%M:%S` 解析，冷却与每日上限实际完全未生效；现改为 `fromisoformat` 优先 + 多格式兜底，且非空但非法的时间串返回 `None` 而不是当有效时间
+- 修复冷却期内被误标记为「未开始」的问题
+- 修复问卷成功判定大小写敏感（Python `True` vs `"true"`）导致已提交用户被判未提交的问题
+- 修复问卷 provider 构建失败被静默跳过（fail-open）的问题：现改为整体停用活动发放
+- 修复 `_claim_inner` 引用未定义变量 `chat_ref` 导致的 `NameError`
+- 修复 `campaigns` 条目的 `star` / `survey` 子配置被当作字典切片处理导致的 `TypeError: unhashable type: 'slice'`
+- 修复 HTTP 可靠性配置键名与开放 API 客户端入参不匹配导致的 `TypeError`：`retry_backoff_ms`（毫秒）与 `circuit_failure_threshold` 现在显式映射为 `retry_backoff_sec` / `circuit_threshold`，不再直接 splat 整个配置节
+
+### Security
+
+- 发放链路一律 fail-closed：配置缺失、Key 无发奖权限、provider 未配置、网络或结构异常都按「暂不可用」收敛，绝不放行
+- GitHub token 缺失时 star 条件一律不通过，不降级为放行
+- 联系方式只进入问卷请求体，不落日志、不落状态文件
+- 参与记录文件只增不删，防止通过删除记录重复领取
+
 ## [v1.6.6] - 2026-09-21
 
 ### Added
