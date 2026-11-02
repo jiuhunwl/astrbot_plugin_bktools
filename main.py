@@ -201,7 +201,7 @@ except ImportError:
     )
 
 
-PLUGIN_VERSION = "1.7.5"
+PLUGIN_VERSION = "1.7.6"
 
 
 def _cfg(root: Any, *keys: str, default: Any = None) -> Any:
@@ -322,6 +322,11 @@ _MUSIC_QUALITY_LABELS = {
 # 「字段标签：值」形态的卡片文本行（QQ 官方机器人 Markdown 排版用）。
 # 标签为 2~10 个非空白、非冒号字符；JSON 行、无冒号行不匹配。
 _MD_FIELD_LINE_RE = re.compile(r"^([^\s：:]{2,10})(?:：|:)\s*(\S.*)$")
+# 「字段标签：URL」整行形态（官方机器人按钮跳转候选行，
+# 如 视频直链/原声链接/音频直链/歌词链接；兼容 Markdown 化后的 **标签**： 行）
+_BUTTON_LINK_LINE_RE = re.compile(
+    r"^(?:\*\*)?([^\s：:*]{2,6})(?:\*\*)?(?:：|:)\s*(https?://\S+)\s*$"
+)
 
 
 def _markdownize_card_text(text: str) -> str:
@@ -2183,45 +2188,21 @@ class BKToolsPlugin(Star):
                         json_text[index : index + chunk_size]
                         for index in range(0, len(json_text), chunk_size)
                     )
-                button_row = None
-                if header_md and link_url:
+                button_rows: List[Any] = []
+                if header_md:
                     msg_cfg = _cfg(self._runtime_config(), "message", default={}) or {}
                     if bool(msg_cfg.get("official_buttons", False)):
-                        button_row = self._official_button_row(link_url)
+                        button_rows = self._official_button_rows(header_md, link_url or "")
                 sent_any = False
                 for index, piece in enumerate(pieces):
                     if self._is_parse_cancelled(parse_token):
                         logger.info("%s分片发送过程中收到停止指令", reason)
                         break
                     is_header = bool(header_md) and index == 0
-                    if is_header and button_row is not None:
-                        # 摘要卡片 + 「原始链接」按钮（需官方平台 keyboard 权限，
-                        # 未授权时发送会失败，降级为无按钮摘要重发一次）
-                        btn_res = event.chain_result([Plain(piece), button_row])
-                        try:
-                            btn_res.use_markdown(True)
-                        except Exception:
-                            pass
-                        outcome = await self._dispatch_send(
-                            event,
-                            btn_res,
-                            f"{reason}（摘要卡片+按钮）",
-                            retry_same_payload=True,
-                        )
-                        if outcome != "ok" and not self._is_parse_cancelled(parse_token):
-                            logger.info("%s，按钮消息发送失败，降级为无按钮摘要", reason)
-                            outcome = await self._dispatch_send(
-                                event,
-                                self._text_result(event, piece, markdown=True),
-                                f"{reason}（摘要卡片）",
-                                retry_same_payload=True,
-                            )
-                    elif is_header:
-                        outcome = await self._dispatch_send(
-                            event,
-                            self._text_result(event, piece, markdown=True),
-                            f"{reason}（摘要卡片）",
-                            retry_same_payload=True,
+                    if is_header:
+                        outcome = await self._send_official_card(
+                            event, piece, button_rows, f"{reason}摘要",
+                            parse_token=parse_token,
                         )
                     else:
                         outcome = await self._dispatch_send(
@@ -2416,14 +2397,18 @@ class BKToolsPlugin(Star):
         forward_nodes: List[Node],
         parse_token: Tuple[str, int],
         label: str,
+        link_url: Optional[str] = None,
     ) -> bool:
         """不支持合并转发的平台降级：把合并转发节点逐条作为普通消息发送。
 
         微信系 / QQ 官方机器人等平台不支持 Nodes，每个 Node 的 content 为
         组件列表（Plain/Image/Video 等），逐个组件独立发送；任一发送失败不
         阻断后续节点（尽力而为），期间可响应停止指令。
+        官方机器人：首个文本卡片按 Markdown 排版发送，开启
+        message.official_buttons 时附加跳转按钮行（卡片+按钮形态）。
         """
         sent_any = False
+        first_card = True
         for node in forward_nodes:
             if self._is_parse_cancelled(parse_token):
                 logger.info("%s降级发送过程中收到停止指令", label)
@@ -2439,10 +2424,23 @@ class BKToolsPlugin(Star):
                     # 其余平台保持与旧版一致的纯文本行为
                     text = str(getattr(comp, "text", "") or "")
                     md_on = self._official_markdown_enabled(event)
-                    send_result = self._text_result(
-                        event,
-                        _markdownize_card_text(text) if md_on else text,
-                    )
+                    card_md = _markdownize_card_text(text) if md_on else text
+                    if first_card:
+                        first_card = False
+                        msg_cfg = (
+                            _cfg(self._runtime_config(), "message", default={}) or {}
+                        )
+                        if bool(msg_cfg.get("official_buttons", False)):
+                            rows = self._official_button_rows(card_md, link_url or "")
+                            if rows:
+                                outcome = await self._send_official_card(
+                                    event, card_md, rows, f"{label}卡片",
+                                    parse_token=parse_token,
+                                )
+                                if outcome == "ok":
+                                    sent_any = True
+                                continue
+                    send_result = self._text_result(event, card_md)
                 else:
                     send_result = event.chain_result([comp])
                 outcome = await self._dispatch_send(
@@ -2462,6 +2460,7 @@ class BKToolsPlugin(Star):
         raw_json: Dict[str, Any],
         parse_token: Tuple[str, int],
         label: str,
+        link_url: Optional[str] = None,
     ) -> bool:
         """合并转发至多发送一次；超时/失败时降级发送解析 JSON 兜底，保证结果不丢失。"""
         send_key = self._send_key(label, raw_json)
@@ -2471,7 +2470,8 @@ class BKToolsPlugin(Star):
         if not forward_nodes:
             logger.warning("%s没有可用的合并转发节点，直接发送解析 JSON", label)
             return await self._send_json_result(
-                event, raw_json, parse_token, f"{label}无法构造合并转发"
+                event, raw_json, parse_token, f"{label}无法构造合并转发",
+                link_url=link_url,
             )
 
         caps = self._adapter_caps(event)
@@ -2482,7 +2482,7 @@ class BKToolsPlugin(Star):
                 "%s平台 %s 不支持合并转发，降级为逐条发送", label, caps["name"]
             )
             return await self._send_forward_as_plain(
-                event, forward_nodes, parse_token, label
+                event, forward_nodes, parse_token, label, link_url=link_url
             )
 
         if self._is_parse_cancelled(parse_token):
@@ -2548,6 +2548,7 @@ class BKToolsPlugin(Star):
         ok = await self._send_json_result(
             event, raw_json, parse_token,
             f"{label}打包消息{'超时' if outcome == 'timeout' else '发送失败'}后降级",
+            link_url=link_url,
         )
         if not ok and release_on_failure:
             # 兜底也没发出去：释放去重标记，允许用户稍后手动重发相同链接
@@ -2763,30 +2764,91 @@ class BKToolsPlugin(Star):
             pass
         return res
 
-    def _official_button_row(self, url: str):
-        """构造「原始链接」跳转按钮行（仅 QQ 官方机器人 keyboard 场景）。
+    def _official_button_rows(
+        self, card_text: str = "", link_url: str = ""
+    ) -> List[Any]:
+        """从摘要卡片与原始链接构造 URL 按钮行（官方机器人 inline keyboard）。
 
-        需要官方平台 keyboard 权限；AstrBot/按钮组件缺失或链接非法时返回 None。
+        - 「原始链接」排最前；卡片里的 视频直链/原声链接/音频直链 等行
+          作为附加跳转按钮（每个按钮 = 一个 URL action）；
+        - QQ keyboard 单行最多 5 个按钮，每个按钮的 URL（action data）
+          不得超过 1024 字节，超长或非法链接直接跳过；
+        - AstrBot 版本过旧无按钮组件时返回空列表（自动停用按钮）。
         """
         if not _BUTTONS_READY or ActionRow is None or Button is None:
-            return None
-        link = (url or "").strip()
-        if not link.startswith(("http://", "https://")):
-            return None
-        try:
-            return ActionRow(
-                buttons=[
+            return []
+        pairs: List[Tuple[str, str]] = []
+        seen: set = set()
+        stripped_link = (link_url or "").strip()
+        if stripped_link.startswith(("http://", "https://")):
+            pairs.append(("原始链接", stripped_link))
+            seen.add(stripped_link)
+        for line in str(card_text or "").splitlines():
+            m = _BUTTON_LINK_LINE_RE.match(line)
+            if not m:
+                continue
+            label, url = m.group(1), m.group(2).strip()
+            if url in seen:
+                continue
+            seen.add(url)
+            pairs.append((label[:10], url))
+        buttons: List[Any] = []
+        stamp = int(time.time() * 1000) % 1000000000
+        for offset, (label, url) in enumerate(pairs[:5]):
+            if len(url.encode("utf-8")) > 1024:
+                continue
+            try:
+                buttons.append(
                     Button(
-                        id=f"bktools_link_{int(time.time() * 1000) % 1000000000}",
-                        label="原始链接",
-                        action=Button.UrlAction(url=link),
+                        id=f"bktools_link_{stamp}_{offset}",
+                        label=label,
+                        action=Button.UrlAction(url=url),
                         style=Button.Style.PRIMARY,
                     )
-                ]
-            )
+                )
+            except Exception as ex:
+                logger.debug("构造按钮 %s 失败: %s", label, ex)
+        if not buttons:
+            return []
+        try:
+            return [ActionRow(buttons=buttons)]
         except Exception as ex:
-            logger.debug("构造官方机器人按钮失败: %s", ex)
-            return None
+            logger.debug("构造按钮行失败: %s", ex)
+            return []
+
+    async def _send_official_card(
+        self,
+        event: AstrMessageEvent,
+        card_md: str,
+        button_rows: List[Any],
+        label: str,
+        parse_token: Optional[Tuple[str, int]] = None,
+    ) -> str:
+        """官方机器人发送 Markdown 卡片（可带按钮行），失败自动降级无按钮。
+
+        parse_token 为 None 时（如音乐解析路径）跳过停止解析检查。
+        返回 _dispatch_send 的 outcome（ok/timeout/failed/rejected）。
+        """
+        if button_rows:
+            res = event.chain_result([Plain(card_md), *button_rows])
+            try:
+                res.use_markdown(True)
+            except Exception:
+                pass
+            outcome = await self._dispatch_send(
+                event, res, f"{label}（卡片+按钮）", retry_same_payload=True
+            )
+            if outcome == "ok" or (
+                parse_token is not None and self._is_parse_cancelled(parse_token)
+            ):
+                return outcome
+            logger.info("%s，按钮消息发送失败（多为未申请 keyboard 权限），降级为无按钮卡片", label)
+        return await self._dispatch_send(
+            event,
+            self._text_result(event, card_md, markdown=True),
+            f"{label}（卡片）",
+            retry_same_payload=True,
+        )
 
     def _bot_identity(self, event: AstrMessageEvent) -> Tuple[str, Any]:
         name = "BKtools"
@@ -3305,7 +3367,7 @@ class BKToolsPlugin(Star):
         if pack:
             flat = _chain_to_forward_nodes(chain, name, uid)
             await self._send_packed_or_json(
-                event, flat, j, parse_token, "短视频解析结果"
+                event, flat, j, parse_token, "短视频解析结果", link_url=link
             )
             return
 
@@ -3456,7 +3518,7 @@ class BKToolsPlugin(Star):
         if pack and nodes:
             flat = _chain_to_forward_nodes(nodes, name, uid)
             await self._send_packed_or_json(
-                event, flat, j, parse_token, "抖音主页作品列表"
+                event, flat, j, parse_token, "抖音主页作品列表", link_url=profile_url
             )
             return
 
@@ -3847,7 +3909,26 @@ class BKToolsPlugin(Star):
                 logger.warning("发送语音消息失败: %s", e)
         
         # 发送文本消息和封面
-        if msg_cfg.get("pack_forward") and cover:
+        music_caps = self._adapter_caps(event)
+        if not music_caps["forward"]:
+            # 不支持 Nodes（QQ 官方机器人 / 微信系）：卡片文本逐条发送。
+            # 官方机器人按 Markdown 排版，开启 official_buttons 时附加跳转按钮
+            # （音频直链/歌词链接/原始分享链接等，取决于卡片实际包含的链接行）。
+            md_on = self._official_markdown_enabled(event)
+            card_md = _markdownize_card_text(text) if md_on else text
+            rows: List[Any] = []
+            msg_cfg_btn = _cfg(self._runtime_config(), "message", default={}) or {}
+            if bool(msg_cfg_btn.get("official_buttons", False)):
+                rows = self._official_button_rows(card_md, req_link or "")
+            if rows:
+                await self._send_official_card(event, card_md, rows, "音乐卡片")
+            else:
+                await event.send(self._text_result(event, card_md))
+            if cover:
+                ci = _make_image_node(str(cover))
+                if ci:
+                    await event.send(event.chain_result([ci]))
+        elif msg_cfg.get("pack_forward") and cover:
             name, uid = self._bot_identity(event)
             cov_node = _make_image_node(str(cover))
             nodes = [Node(name=name, uin=uid, content=[Plain(text)])]

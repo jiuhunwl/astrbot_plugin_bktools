@@ -11,6 +11,7 @@ import os
 import pathlib
 import sys
 import unittest
+from unittest.mock import patch
 
 _ROOT = pathlib.Path(__file__).resolve().parents[1]
 if str(_ROOT) not in sys.path:
@@ -817,7 +818,6 @@ class OfficialMarkdownTests(unittest.IsolatedAsyncioTestCase):
     async def test_button_attached_and_fallback_without_button(self):
         """开启按钮：摘要带按钮发送；无 keyboard 权限失败时降级无按钮重发。"""
         plugin = self._plugin({"official_buttons": True})
-        plugin._official_button_row = lambda url: {"fake": "row"}
         event = _MDEvent("qq_official")
 
         async def send(result):
@@ -826,14 +826,45 @@ class OfficialMarkdownTests(unittest.IsolatedAsyncioTestCase):
             event.sent.append(result)
 
         event.send = send
-        ok = await plugin._send_json_result(
-            event, {"code": 200}, ("t", 0), "测试",
-            header_text="标题：测试", link_url="https://v.douyin.com/abc/",
-        )
+        with patch.object(bk, "_BUTTONS_READY", True), \
+                patch.object(bk, "Button", _StubButton), \
+                patch.object(bk, "ActionRow", _StubActionRow):
+            ok = await plugin._send_json_result(
+                event, {"code": 200}, ("t", 0), "测试",
+                header_text="标题：测试", link_url="https://v.douyin.com/abc/",
+            )
         self.assertTrue(ok)
         self.assertEqual(len(event.sent), 2)
+        # 第一条是无按钮降级卡片（Markdown），第二条是 JSON 分片
         self.assertEqual(event.sent[0].markdown, True)
-        self.assertEqual(event.sent[1].markdown, False)  # JSON 分片
+        self.assertEqual(event.sent[1].markdown, False)
+
+    async def test_forward_plain_first_card_with_buttons(self):
+        """正常解析降级路径：官方机器人首卡片附按钮行（卡片+按钮形态）。"""
+        plugin = self._plugin({"official_buttons": True})
+        card = bk.Plain()
+        card.text = "标题：测试\n视频直链：https://x.com/v.mp4"
+        nodes = [
+            bk.Node(name="B", uin=10000, content=[card]),
+            bk.Node(name="B", uin=10000, content=[bk.Image("https://x.com/1.jpg")]),
+        ]
+        event = _MDEvent("qq_official")
+        with patch.object(bk, "_BUTTONS_READY", True), \
+                patch.object(bk, "Button", _StubButton), \
+                patch.object(bk, "ActionRow", _StubActionRow):
+            sent = await plugin._send_forward_as_plain(
+                event, nodes, ("t", 0), "测试降级",
+                link_url="https://v.douyin.com/abc",
+            )
+        self.assertTrue(sent)
+        first = event.sent[0]
+        self.assertEqual(first.kind, "chain")
+        self.assertEqual(first.markdown, True)
+        # [Plain 卡片, ActionRow 按钮行]
+        self.assertEqual(len(first.content), 2)
+        labels = [b.label for b in first.content[1].buttons]
+        self.assertEqual(labels[0], "原始链接")
+        self.assertIn("视频直链", labels)
 
     async def test_buttons_default_off_no_button_message(self):
         """默认配置不开按钮：只有纯摘要消息，没有 chain 形态按钮消息。"""
@@ -863,6 +894,83 @@ class OfficialMarkdownTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(len(event.sent), 2)
         self.assertIn("**标题**：测试视频", event.sent[0].text)
         self.assertEqual(event.sent[0].markdown, True)
+
+
+class _StubButton:
+    """按钮组件测试桩（模拟 bk.Button 接口）。"""
+
+    class Style:
+        PRIMARY = "primary"
+
+    class UrlAction:
+        def __init__(self, url):
+            self.url = url
+
+    def __init__(self, id, label, action, style=None):
+        self.id = id
+        self.label = label
+        self.action = action
+        self.style = style
+
+
+class _StubActionRow:
+    def __init__(self, buttons):
+        self.buttons = buttons
+
+
+class OfficialButtonRowsTests(unittest.TestCase):
+    """官方机器人按钮行：多按钮 + 超长 URL 过滤 + 组件缺失停用。"""
+
+    def _plugin(self, message_cfg=None):
+        cfg = {"opening_enable": False, "short_video_text_metadata": True}
+        cfg.update(message_cfg or {})
+        return bk.BKToolsPlugin(
+            object(),
+            {"message": cfg, "video_threshold": {"threshold_enabled": False}},
+        )
+
+    def _rows(self, plugin, card, link):
+        with patch.object(bk, "_BUTTONS_READY", True), \
+                patch.object(bk, "Button", _StubButton), \
+                patch.object(bk, "ActionRow", _StubActionRow):
+            return plugin._official_button_rows(card, link)
+
+    def test_link_and_card_urls(self):
+        plugin = self._plugin()
+        card = "曲名：歌\n音频直链：https://m.example.com/a.mp3\n歌词链接：https://l.example.com/x"
+        rows = self._rows(plugin, card, "https://v.douyin.com/abc")
+        self.assertEqual(len(rows), 1)
+        labels = [b.label for b in rows[0].buttons]
+        self.assertEqual(labels[0], "原始链接")
+        self.assertIn("音频直链", labels)
+        self.assertIn("歌词链接", labels)
+        urls = [b.action.url for b in rows[0].buttons]
+        self.assertEqual(urls[0], "https://v.douyin.com/abc")
+
+    def test_oversize_url_skipped(self):
+        """超过 1024 字节的直链不能作为按钮（QQ keyboard action data 上限）。"""
+        plugin = self._plugin()
+        card = "视频直链：https://x.com/" + "a" * 2000
+        rows = self._rows(plugin, card, "https://v.douyin.com/abc")
+        labels = [b.label for b in rows[0].buttons]
+        self.assertEqual(labels, ["原始链接"])
+
+    def test_components_missing_returns_empty(self):
+        """AstrBot 无按钮组件（_BUTTONS_READY False）→ 空列表自动停用。"""
+        plugin = self._plugin()
+        self.assertEqual(plugin._official_button_rows("标题：x", "https://a.com"), [])
+
+    def test_no_urls_returns_empty(self):
+        plugin = self._plugin()
+        self.assertEqual(self._rows(plugin, "标题：x", ""), [])
+
+    def test_max_five_buttons(self):
+        plugin = self._plugin()
+        card = "".join(
+            f"链接{i}：https://x.com/{i}\n" for i in range(8)
+        )
+        rows = self._rows(plugin, card, "https://v.douyin.com/abc")
+        self.assertLessEqual(len(rows[0].buttons), 5)
 
 
 if __name__ == "__main__":
