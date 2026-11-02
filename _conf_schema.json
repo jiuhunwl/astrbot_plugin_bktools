@@ -1114,18 +1114,20 @@
       "parse_author": {
         "description": "歌手字段路径",
         "type": "string",
-        "default": "ar_name",
+        "default": "singer",
         "condition": {
           "advanced_settings": true
-        }
+        },
+        "hint": "音乐 2.0 歌手字段；旧版 1.0 字段（ar_name/artistsname 等）自动兜底。"
       },
       "parse_cover": {
         "description": "封面字段路径",
         "type": "string",
-        "default": "pic",
+        "default": "cover",
         "condition": {
           "advanced_settings": true
-        }
+        },
+        "hint": "音乐 2.0 封面字段；旧版 pic 等自动兜底。"
       },
       "parse_audio_url": {
         "description": "音频直链字段路径",
@@ -1146,10 +1148,11 @@
       "parse_album": {
         "description": "专辑字段路径",
         "type": "string",
-        "default": "al_name",
+        "default": "album",
         "condition": {
           "advanced_settings": true
-        }
+        },
+        "hint": "音乐 2.0 专辑字段；旧版 al_name/albumname 自动兜底。"
       },
       "parse_size": {
         "description": "文件大小字段路径",
@@ -1162,10 +1165,11 @@
       "parse_quality": {
         "description": "音质字段路径",
         "type": "string",
-        "default": "level",
+        "default": "label",
         "condition": {
           "advanced_settings": true
-        }
+        },
+        "hint": "音乐 2.0 音质标签字段（已是中文，如“极高音质”）；label 缺失时依次回退 level/quality_type 映射。"
       }
     }
   },
@@ -1228,18 +1232,20 @@
       "qishui_title_path": {
         "description": "汽水音乐标题字段路径",
         "type": "string",
-        "default": "albumname",
+        "default": "name",
         "condition": {
           "advanced_settings": true
-        }
+        },
+        "hint": "音乐 2.0 曲名字段；旧版 1.0 字段（albumname 等）自动兜底。"
       },
       "qishui_author_path": {
         "description": "汽水音乐歌手字段路径",
         "type": "string",
-        "default": "artistsname",
+        "default": "singer",
         "condition": {
           "advanced_settings": true
-        }
+        },
+        "hint": "音乐 2.0 歌手字段；旧版 artistsname 自动兜底。"
       },
       "qishui_audio_path": {
         "description": "汽水音乐音频字段路径",
@@ -1252,10 +1258,11 @@
       "qishui_cover_path": {
         "description": "汽水音乐封面字段路径",
         "type": "string",
-        "default": "artistsmedium_avatar_url.0",
+        "default": "cover",
         "condition": {
           "advanced_settings": true
-        }
+        },
+        "hint": "音乐 2.0 封面字段；旧版 artistsmedium_avatar_url.0 自动兜底。"
       },
       "qishui_lyric_path": {
         "description": "汽水音乐歌词字段路径",

@@ -973,5 +973,112 @@ class OfficialButtonRowsTests(unittest.TestCase):
         self.assertLessEqual(len(rows[0].buttons), 5)
 
 
+class MusicV2FormatTests(unittest.TestCase):
+    """音乐解析统一 JSON 2.0 适配：新字段默认优先、1.0 字段兜底、卡片新行。"""
+
+    V2 = {
+        "type": "music",
+        "platform": "qishui",
+        "id": "7387697402612500481",
+        "name": "示例歌曲",
+        "singer": "示例歌手",
+        "artists": [{"id": "64229713379884", "name": "示例歌手2", "avatar": "https://p3.example.com/a.jpeg"}],
+        "album": "示例专辑",
+        "cover": "https://p3.example.com/cover.jpeg",
+        "duration_ms": 252794,
+        "full_duration_ms": 252794,
+        "preview": False,
+        "lyric": "[00:00.240]示例第一行\n[00:04.000]示例第二行",
+        "url": "https://v11-luna.douyinvod.com/xxx",
+        "level": "highest",
+        "label": "极高音质",
+        "quality_type": 3,
+        "br": 257694,
+        "size": 1930486,
+        "size_label": "1.84MB",
+        "format": "m4a",
+        "codec": "aac",
+        "qualities": [
+            {"label": "极高音质", "level": "highest", "quality_type": 3,
+             "url": "https://x/h.m4a", "size_label": "1.84MB"},
+            {"label": "无损音质", "level": "lossless", "quality_type": 4,
+             "url": "", "locked": True},
+        ],
+    }
+
+    def _fields(self, data, **kw):
+        return bk._extract_music_fields(data, {"data": data}, **kw)
+
+    def test_v2_fields_extracted_with_new_defaults(self):
+        """2.0 新默认路径（name/singer/album/label）直接命中。"""
+        f = self._fields(self.V2)
+        self.assertEqual(f["title"], "示例歌曲")
+        self.assertEqual(f["author"], "示例歌手")
+        self.assertEqual(f["album"], "示例专辑")
+        self.assertEqual(f["cover"], "https://p3.example.com/cover.jpeg")
+        self.assertEqual(f["level"], "极高音质")  # label 原样展示（已是中文）
+        self.assertEqual(f["bitrate"], "258kbps")  # 2.0 br（bit/s）
+        self.assertEqual(f["size"], "1.84MB")
+        self.assertEqual(f["duration"], "04:12")  # full_duration_ms 毫秒换算
+        self.assertEqual(f["preview"], "")
+        self.assertEqual(f["mtype"], "music")
+
+    def test_v1_fields_fall_back_from_new_defaults(self):
+        """回归：1.0 字段（albumname/artistsname/ar_name/al_name/pic）仍可兜底。"""
+        v1 = {
+            "albumname": "来自天堂的魔鬼",
+            "artistsname": "Zxxy",
+            "ar_name": "Zxxy",
+            "al_name": "同名专辑",
+            "pic": "https://p3.douyinpic.com/x.jpeg",
+            "url": "https://x/a.m4a",
+        }
+        # 模拟已升级为新默认路径的配置（旧后端字段全部 miss）
+        f = self._fields(v1, title_p="name", author_p="singer", album_p="album",
+                         level_p="label")
+        self.assertEqual(f["title"], "来自天堂的魔鬼")
+        self.assertEqual(f["author"], "Zxxy")
+        self.assertEqual(f["album"], "同名专辑")
+        self.assertEqual(f["cover"], "https://p3.douyinpic.com/x.jpeg")
+
+    def test_v2_card_lines(self):
+        card = bk._format_music_card("qishui", self._fields(self.V2))
+        self.assertNotIn("类型：", card)  # music 类型不显示类型行
+        self.assertIn("时长：04:12", card)
+        self.assertNotIn("试听片段", card)
+        self.assertIn("音质：M4A · 极高音质 · 258kbps", card)
+        self.assertIn("音质档：极高音质 1.84MB / 无损音质（无权限）", card)
+        self.assertIn("歌词预览：\n示例第一行\n示例第二行", card)
+
+    def test_v2_preview_flag(self):
+        data = dict(self.V2, preview=True, duration_ms=30000)
+        card = bk._format_music_card("qishui", self._fields(data))
+        self.assertIn("时长：04:12（试听片段）", card)
+
+    def test_v2_mv_type_line(self):
+        data = dict(self.V2, type="mv")
+        card = bk._format_music_card("qishui", self._fields(data))
+        self.assertIn("类型：MV", card)
+
+    def test_quality_type_label_fallback(self):
+        """label/level 均缺失时按 quality_type 统一编号映射中文标签。"""
+        data = {
+            "name": "歌", "quality_type": 4,
+            "url": "https://x/a.flac",
+            "qualities": [],
+        }
+        f = self._fields(data)
+        self.assertEqual(f["level"], "无损音质")
+
+    def test_qualities_summary_capped(self):
+        qs = [
+            {"label": f"档位{i}", "quality_type": i, "url": f"https://x/{i}"}
+            for i in range(7)
+        ]
+        text = bk._summarize_music_qualities(qs)
+        self.assertTrue(text.endswith("等共7档"))
+        self.assertEqual(text.count(" / "), 4)  # 最多 5 项
+
+
 if __name__ == "__main__":
     unittest.main()

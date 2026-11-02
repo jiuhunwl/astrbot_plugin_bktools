@@ -4,6 +4,21 @@
 
 格式参考 Keep a Changelog，并遵循语义化版本管理思路。
 
+## [v1.7.7] - 2026-11-02
+
+### Added
+
+- 适配《音乐解析统一 JSON 格式 2.0》（2026-10-31）的字段与卡片展示：
+  - 字段默认路径改为 2.0 字段名优先：曲名 `name`、歌手 `singer`（含 `artists[].name`）、专辑 `album`、封面 `cover`、音质标签 `label`（已是中文直接展示）、码率 `br`；1.0 旧字段（albumname/artistsname/ar_name/al_name/pic 等）全部保留为兜底候选，未升级的后端不受影响
+  - 卡片新增行：**时长**（`full_duration_ms`/`duration_ms` 毫秒换算 mm:ss）、**音质档**（`qualities[]` 多档摘要，如 `极高音质 1.84MB / 无损音质（无权限）`，最多 5 档、locked 档标注无权限）、`type=mv` 时显示 **类型：MV**、`preview: true` 时时长后追加 **（试听片段）** 提示
+  - `label`/`level` 均缺失时按 2.0 `quality_type` 统一编号映射中文标签（1=标准音质 … 6=空间音频）
+  - 歌词为空时回退读取翻译歌词 `tlyric`
+- 配置默认值同步（`netease.parse_author/parse_cover/parse_album/parse_quality`、`link_only_music.qishui_title_path/qishui_author_path/qishui_cover_path`）：已保存过配置的实例沿用旧值，靠候选链自动兜底 2.0/1.0
+
+### Fixed
+
+- 专辑兜底链顺序修正：1.0 的 `al_name`（真实专辑字段）优先于 `albumname`（1.0 汽水里存的是曲名），避免把曲名当专辑展示
+
 ## [v1.7.6] - 2026-11-02
 
 ### Added

@@ -201,7 +201,7 @@ except ImportError:
     )
 
 
-PLUGIN_VERSION = "1.7.6"
+PLUGIN_VERSION = "1.7.7"
 
 
 def _cfg(root: Any, *keys: str, default: Any = None) -> Any:
@@ -318,6 +318,67 @@ _MUSIC_QUALITY_LABELS = {
     "higher": "较高", "highest": "极高", "exhigh": "极高", "lossless": "无损",
     "hires": "Hi-Res", "sq": "无损", "hq": "高",
 }
+
+# 音乐解析统一 JSON 2.0：quality_type（音频跨平台统一编号）→ 中文标签。
+# label / level 均缺失时的兜底展示（mv 的 quality_type 走视频编号，不适用本表）。
+_MUSIC_QUALITY_TYPE_LABELS = {
+    0: "低音质", 1: "标准音质", 2: "较高音质", 3: "极高音质",
+    4: "无损音质", 5: "录音室音质", 6: "空间音频",
+}
+
+
+def _format_duration_from_ms(value: Any) -> str:
+    """毫秒时长 → mm:ss / hh:mm:ss（音乐 2.0 的 duration_ms 原生单位）。"""
+    if isinstance(value, bool):
+        return ""
+    try:
+        seconds = float(value) / 1000.0
+    except (TypeError, ValueError):
+        return ""
+    if seconds <= 0:
+        return ""
+    return _format_duration(int(seconds))
+
+
+def _summarize_music_qualities(qualities: Any, *, max_items: int = 5) -> str:
+    """把 2.0 的 qualities[] 摘要为可读文本："极高音质 1.84MB / 无损音质 8.9MB"。
+
+    只统计有可用地址的档位；locked（无权限）档显示"（无权限）"；超过
+    max_items 截断并追加"等"。
+    """
+    if not isinstance(qualities, list):
+        return ""
+    parts: List[str] = []
+    for item in qualities:
+        if not isinstance(item, dict) or len(parts) >= max_items:
+            break
+        label = _clean_meta(item.get("label")) or _clean_meta(item.get("level"))
+        if not label:
+            qt = item.get("quality_type")
+            label = _MUSIC_QUALITY_TYPE_LABELS.get(qt if isinstance(qt, int) else -1, "")
+        if not label:
+            continue
+        size_text = _clean_meta(item.get("size_label")) or _format_audio_size(
+            item.get("size")
+        )
+        locked = item.get("locked") is True or _clean_meta(
+            item.get("locked")
+        ).lower() in ("true", "1")
+        if locked:
+            suffix = "（无权限）"
+        elif _clean_meta(item.get("url")):
+            suffix = f" {size_text}" if size_text else ""
+        else:
+            # 无地址且未标记 locked：按无权限处理（契约下 url 空即锁定）
+            suffix = "（无权限）"
+        parts.append(f"{label}{suffix}")
+    if not parts:
+        return ""
+    text = " / ".join(parts)
+    total = len([q for q in qualities if isinstance(q, dict)])
+    if total > max_items:
+        text += f" 等共{total}档"
+    return text
 
 # 「字段标签：值」形态的卡片文本行（QQ 官方机器人 Markdown 排版用）。
 # 标签为 2~10 个非空白、非冒号字符；JSON 行、无冒号行不匹配。
@@ -448,35 +509,66 @@ def _extract_music_fields(
     """按统一契约抽取音乐字段：多路径兜底 + 占位符过滤 + 可读化转换。
 
     配置的字段路径优先，其后跟随各平台常见字段名兜底，避免上游改字段后
-    卡片直接变成 `曲名：—`。
+    卡片直接变成 `曲名：—`。候选顺序以《音乐解析统一 JSON 格式 2.0》
+    字段名（name/singer/album/label/br/duration_ms/qualities[]）为先，
+    1.0 旧字段名（albumname/artistsname/ar_name/al_name 等）作为兜底保留。
     """
+    data_obj = data if isinstance(data, dict) else {}
+    # 2.0：type=music（音频）/mv（音乐视频）；1.0 无此字段
+    mtype = str(data_obj.get("type") or "").strip().lower()
+    # 2.0：试听片段标记（boolean，_clean_meta 会过滤 bool，需单独读取）
+    preview = data_obj.get("preview") is True or _clean_meta(
+        data_obj.get("preview")
+    ).lower() in ("true", "1")
+    qualities_text = _summarize_music_qualities(data_obj.get("qualities"))
+    level_raw = _first_meta(
+        data, (level_p, "label", "level", "video_meta.quality", "quality"), json_root
+    )
+    level_text = _format_music_quality(level_raw)
+    if not level_text:
+        # 2.0：label/level 均缺失时按 quality_type 统一编号映射中文标签
+        qt = data_obj.get("quality_type")
+        if isinstance(qt, int) and not isinstance(qt, bool):
+            level_text = _MUSIC_QUALITY_TYPE_LABELS.get(qt, "")
     return {
         "title": _first_meta(
-            data, (title_p, "albumname", "title", "name", "songname", "song_name"), json_root
+            data,
+            (title_p, "name", "title", "songname", "song_name", "albumname"),
+            json_root,
         ),
         "author": _first_meta(
             data,
-            (author_p, "artistsname", "artist_name", "artist", "author", "ar_name", "singers"),
+            (
+                author_p, "singer", "artists.0.name", "artistsname",
+                "artist_name", "artist", "author", "ar_name", "singers",
+            ),
             json_root,
         ),
         "cover": _first_meta(
-            data, (cover_p, "artistsmedium_avatar_url.0", "cover", "pic", "cover_url"), json_root
+            data, (cover_p, "cover", "pic", "cover_url", "artistsmedium_avatar_url.0"), json_root
         ),
         "audio": _first_meta(data, (audio_p, "url", "download_url", "music_url"), json_root),
-        "lyric": _first_meta(data, (lyric_p, "lyric"), json_root),
-        "album": _first_meta(data, (album_p, "albumname", "album", "al_name"), json_root),
+        "lyric": _first_meta(data, (lyric_p, "lyric", "tlyric"), json_root),
+        "album": _first_meta(
+            # 1.0 汽水的 albumname 存的是曲名而非专辑名，故 al_name 优先于 albumname
+            data, (album_p, "album", "al_name", "albumname"), json_root
+        ),
         "size": _format_audio_size(
-            _first_meta(data, (size_p, "Size", "size", "video_meta.size"), json_root)
+            _first_meta(data, (size_p, "size", "Size", "video_meta.size"), json_root)
         ),
         "format": _first_meta(
-            data, ("Format", "format", "video_meta.vtype", "video_meta.codec_type", "Codec"), json_root
+            data, ("format", "Format", "video_meta.vtype", "video_meta.codec_type", "Codec"), json_root
         ).upper(),
-        "level": _format_music_quality(
-            _first_meta(data, (level_p, "video_meta.quality", "quality"), json_root)
-        ),
+        "level": level_text,
         "bitrate": _format_bitrate(
-            _first_meta(data, ("Bitrate", "bitrate", "video_meta.bitrate"), json_root)
+            _first_meta(data, ("br", "Bitrate", "bitrate", "video_meta.bitrate"), json_root)
         ),
+        "duration": _format_duration_from_ms(
+            _first_meta(data, ("full_duration_ms", "duration_ms"), json_root)
+        ),
+        "preview": "1" if preview else "",
+        "mtype": mtype,
+        "qualities": qualities_text,
     }
 
 
@@ -484,18 +576,29 @@ def _format_music_card(plat: str, fields: Mapping[str, str]) -> str:
     """渲染音乐解析卡片：平台名中文化，空字段按契约省略对应行。
 
     音频/歌词直链始终完整展示（截断后的链接无法复制使用）。
+    2.0 新增：type=mv 类型行、时长（毫秒换算）与试听片段提示、
+    qualities[] 多音质摘要行。
     """
     lines = [f"平台：{_MUSIC_PLATFORM_LABELS.get(plat, plat)}"]
     lines.append(f"曲名：{fields['title']}" if fields.get("title") else "曲名：—")
+    if fields.get("mtype") == "mv":
+        lines.append("类型：MV")
     if fields.get("author"):
         lines.append(f"艺人：{fields['author']}")
     if fields.get("album"):
         lines.append(f"专辑：{fields['album']}")
+    if fields.get("duration"):
+        duration_line = f"时长：{fields['duration']}"
+        if fields.get("preview"):
+            duration_line += "（试听片段）"
+        lines.append(duration_line)
     if fields.get("size"):
         lines.append(f"大小：{fields['size']}")
     quality_bits = [fields[k] for k in ("format", "level", "bitrate") if fields.get(k)]
     if quality_bits:
         lines.append("音质：" + " · ".join(quality_bits))
+    if fields.get("qualities"):
+        lines.append(f"音质档：{fields['qualities']}")
     lines.append(f"音频：{str(fields.get('audio') or '').strip()}")
     lyric = str(fields.get("lyric") or "")
     if lyric:
@@ -3689,13 +3792,13 @@ class BKToolsPlugin(Star):
             ok = _parse_success_codes(str(ne.get("parse_success_codes", "200")))
             droot = (ne.get("parse_data_root") or "data").strip() or "data"
             title_p = ne.get("parse_title") or "name"
-            author_p = ne.get("parse_author") or "ar_name"
-            cover_p = ne.get("parse_cover") or "pic"
+            author_p = ne.get("parse_author") or "singer"
+            cover_p = ne.get("parse_cover") or "cover"
             audio_p = ne.get("parse_audio_url") or "url"
             lyric_p = ne.get("parse_lyric") or "lyric"
-            album_p = ne.get("parse_album") or "al_name"
+            album_p = ne.get("parse_album") or "album"
             size_p = ne.get("parse_size") or "size"
-            level_p = ne.get("parse_quality") or "level"
+            level_p = ne.get("parse_quality") or "label"
         else:
             if plat == "qq":
                 endpoint = (lo.get("qq_endpoint") or "").strip()
@@ -3722,10 +3825,13 @@ class BKToolsPlugin(Star):
                 audio_p = lo.get("generic_audio_url") or "url"
                 lyric_p = lo.get("qq_lyric_path") or "lrc_data"
             elif plat == "qishui":
-                title_p = lo.get("qishui_title_path") or "albumname"
-                author_p = lo.get("qishui_author_path") or "artistsname"
+                # 2.0 字段名（name/singer/album/cover）优先；1.0 旧字段
+                # （albumname/artistsname/artistsmedium_avatar_url.0）
+                # 由 _extract_music_fields 的候选链兜底
+                title_p = lo.get("qishui_title_path") or "name"
+                author_p = lo.get("qishui_author_path") or "singer"
                 audio_p = lo.get("qishui_audio_path") or "url"
-                cover_p = lo.get("qishui_cover_path") or "artistsmedium_avatar_url.0"
+                cover_p = lo.get("qishui_cover_path") or "cover"
                 lyric_p = lo.get("qishui_lyric_path") or "lyric"
             elif use_kuwo_paths:
                 title_p = lo.get("kuwo_title_path") or "title"

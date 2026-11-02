@@ -1,6 +1,13 @@
 # astrbot_plugin_bktools（BKtools）
 
-当前版本：`v1.7.6`，要求 AstrBot `v4.10.4+`，已验证兼容 AstrBot `v4.25.5`。
+当前版本：`v1.7.7`，要求 AstrBot `v4.10.4+`，已验证兼容 AstrBot `v4.25.5`。
+
+## v1.7.7 音乐解析 2.0 格式适配
+
+- 适配《音乐解析统一 JSON 格式 2.0》：字段默认路径改为 2.0 字段名优先（`name`/`singer`/`album`/`cover`/`label`/`br`），1.0 旧字段全部保留兜底，未升级的后端不受影响
+- 音乐卡片新增：**时长**（毫秒换算）、**音质档**多档摘要（`qualities[]`，locked 档标注无权限）、MV 类型行、**试听片段**提示（`preview: true`）
+- `label`/`level` 缺失时按 `quality_type` 统一编号映射中文音质标签；歌词为空回退翻译歌词 `tlyric`
+- 修复专辑兜底顺序：1.0 的 `al_name` 优先于 `albumname`（汽水 1.0 里后者存的是曲名）
 
 ## v1.7.6 官方机器人卡片+按钮
 
