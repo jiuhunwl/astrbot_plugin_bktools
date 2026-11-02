@@ -201,7 +201,7 @@ except ImportError:
     )
 
 
-PLUGIN_VERSION = "1.7.8"
+PLUGIN_VERSION = "1.7.9"
 
 
 def _cfg(root: Any, *keys: str, default: Any = None) -> Any:
@@ -2608,6 +2608,10 @@ class BKToolsPlugin(Star):
         sent_any = False
         first_card = True
         cover_url = ""
+        try:
+            caps_name = self._adapter_caps(event)["name"]
+        except Exception:
+            caps_name = "unknown"
         # 预扫描首个公网图片组件作为卡片内嵌封面（短视频封面/音乐封面/图集首图）
         for node in forward_nodes:
             content = getattr(node, "content", None)
@@ -2650,6 +2654,10 @@ class BKToolsPlugin(Star):
                         )
                         card_md = _render_player_card_md(
                             text, cover_url=cover_url, buttons_enabled=bool(rows)
+                        )
+                        logger.info(
+                            "BKtools v%s 官方机器人播放器卡片已渲染（平台=%s, 封面=%s, 按钮=%s）",
+                            PLUGIN_VERSION, caps_name, bool(cover_url), bool(rows),
                         )
                         if rows:
                             outcome = await self._send_official_card(
@@ -4172,6 +4180,10 @@ class BKToolsPlugin(Star):
                 card_md = _render_player_card_md(
                     text, cover_url=str(cover or ""), buttons_enabled=bool(rows)
                 )
+                logger.info(
+                    "BKtools v%s 官方机器人音乐播放器卡片已渲染（封面=%s, 按钮=%s）",
+                    PLUGIN_VERSION, bool(cover), bool(rows),
+                )
                 if rows:
                     outcome = await self._send_official_card(
                         event, card_md, rows, "音乐卡片"
@@ -4463,6 +4475,21 @@ class BKToolsPlugin(Star):
             checks.append(f"✅ 活动配置：共 {len(campaigns_raw)} 个活动")
         else:
             checks.append("⚠️ 活动配置：未配置任何活动（campaigns 为空）")
+        # 官方机器人（qq_official 系）环境自检：版本 / Markdown / 全量消息指引
+        try:
+            caps = self._adapter_caps(event)
+            if caps.get("markdown") or caps.get("name") == "qq_official":
+                md_on = self._official_markdown_enabled(event)
+                checks.append(
+                    f"{'✅' if md_on else '⚠️'} 官方机器人：v{PLUGIN_VERSION}，Markdown 排版"
+                    f"{'已启用' if md_on else '未启用（检查 message.official_markdown）'}"
+                )
+                checks.append(
+                    "ℹ️ 非@消息：需在 QQ 开放平台开通「接收所有消息」，且群主在群设置"
+                    "里把机器人消息范围改为「接收全部消息」，否则群里必须 @ 机器人才触发"
+                )
+        except Exception:
+            pass
         await event.send(event.plain_result("【BKtools 诊断】\n" + "\n".join(checks)))
 
     @filter.command("bk帮助")
