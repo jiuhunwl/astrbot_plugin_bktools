@@ -43,7 +43,7 @@ def _load_main():
     )
     modules["astrbot.api.event"].filter = _Filter()
     modules["astrbot.api.event"].AstrMessageEvent = object
-    for name in ("Image", "Node", "Nodes", "Plain", "Record", "Video"):
+    for name in ("Image", "Node", "Nodes", "Plain", "Record", "Video", "File"):
         setattr(modules["astrbot.api.message_components"], name, _Component)
     modules["astrbot.api.star"].Context = object
     modules["astrbot.api.star"].Star = type(

@@ -458,6 +458,16 @@
         },
         "hint": "在作品文字信息末尾保留用户发送的原始链接，便于回溯。"
       },
+      "batch_full_response_mode": {
+        "description": "批量超阈值时完整响应的发送方式",
+        "type": "string",
+        "options": [
+          "file",
+          "forward"
+        ],
+        "default": "file",
+        "hint": "file：先发可读摘要卡片，再把完整响应保存为 JSON 文件发送（默认；NapCat 对过大的合并转发常报 retcode 1200，文件方式稳定得多）。forward：沿用打包合并转发消息。file 模式下若 AstrBot 与 NapCat 分离部署（不同容器/机器），需在 AstrBot 配置 callback_api_base，否则 NapCat 读不到本地文件，会自动降级为打包消息。"
+      },
       "max_images_per_work": {
         "description": "每个作品最多展示图片数",
         "type": "int",

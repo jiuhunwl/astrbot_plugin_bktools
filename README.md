@@ -1,6 +1,6 @@
 # astrbot_plugin_bktools（BKtools）
 
-当前版本：`v1.7.2`，要求 AstrBot `v4.10.4+`，已验证兼容 AstrBot `v4.25.5`。
+当前版本：`v1.7.3`，要求 AstrBot `v4.10.4+`，已验证兼容 AstrBot `v4.25.5`。
 
 ## v1.7.1 引用消息链接修复
 

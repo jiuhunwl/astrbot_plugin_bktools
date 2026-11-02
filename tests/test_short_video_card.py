@@ -6,6 +6,8 @@ duration、create_time/publish_time 归一化与展示，以及批量阈值打�
 from __future__ import annotations
 
 import asyncio
+import json
+import os
 import pathlib
 import sys
 import unittest
@@ -265,16 +267,16 @@ class CardFormatTests(unittest.TestCase):
 class BatchOutputTests(unittest.IsolatedAsyncioTestCase):
     """批量阈值 → 完整响应打包消息。"""
 
-    def _plugin(self, batch_cfg):
-        return bk.BKToolsPlugin(
-            object(),
-            {
-                "batch_output": batch_cfg,
-                "message": {"opening_enable": False},
-                # 关闭视频大小探测，避免测试发起真实网络请求
-                "video_threshold": {"threshold_enabled": False},
-            },
-        )
+    def _plugin(self, batch_cfg, message_cfg=None):
+        cfg = {
+            "batch_output": batch_cfg,
+            "message": {"opening_enable": False},
+            # 关闭视频大小探测，避免测试发起真实网络请求
+            "video_threshold": {"threshold_enabled": False},
+        }
+        if message_cfg:
+            cfg["message"].update(message_cfg)
+        return bk.BKToolsPlugin(object(), cfg)
 
     async def _reply(self, plugin, data):
         j = {"code": 200, "msg": "解析成功", "data": data}
@@ -287,7 +289,8 @@ class BatchOutputTests(unittest.IsolatedAsyncioTestCase):
         data = sample_data(images=[f"https://x.com/{i}.jpg" for i in range(5)])
         plugin = self._plugin(
             {"direct_json_enabled": True, "image_count_threshold": 3,
-             "live_photo_count_threshold": 10}
+             "live_photo_count_threshold": 10},
+            message_cfg={"batch_full_response_mode": "forward"},
         )
         event = await self._reply(plugin, data)
         self.assertEqual(len(event.sent), 1)
@@ -297,6 +300,78 @@ class BatchOutputTests(unittest.IsolatedAsyncioTestCase):
         self.assertIn("标题：", joined)      # 摘要卡片
         self.assertIn('"code":200', joined)  # 完整响应
         self.assertIn('"images"', joined)
+
+    async def test_threshold_default_sends_summary_plus_json_file(self):
+        """默认 file 模式：摘要卡片（普通文本）+ JSON 文件（File 组件）。"""
+        data = sample_data(images=[f"https://x.com/{i}.jpg" for i in range(5)])
+        plugin = self._plugin(
+            {"direct_json_enabled": True, "image_count_threshold": 3,
+             "live_photo_count_threshold": 10}
+        )
+        event = await self._reply(plugin, data)
+        self.assertEqual(len(event.sent), 2)
+        kind0, payload0 = event.sent[0]
+        self.assertEqual(kind0, "plain")
+        self.assertIn("标题：", payload0)
+        kind1, payload1 = event.sent[1]
+        self.assertEqual(kind1, "chain")
+        (comp,) = payload1
+        self.assertEqual(comp.kwargs.get("name", "").startswith("BKtools_解析响应_"), True)
+        fpath = comp.kwargs.get("file")
+        self.assertTrue(os.path.exists(fpath))
+        with open(fpath, "rb") as fh:
+            content = json.loads(fh.read().decode("utf-8"))
+        self.assertEqual(content["code"], 200)
+        self.assertIn("images", content["data"])
+        os.remove(fpath)
+
+    async def test_threshold_file_mode_redacts_credentials(self):
+        data = sample_data(extra={"token": "SECRET"})
+        plugin = self._plugin(
+            {"direct_json_enabled": True, "image_count_threshold": 0,
+             "live_photo_count_threshold": 0}
+        )
+        event = await self._reply(plugin, data)
+        kind, payload = event.sent[1]
+        (comp,) = payload
+        with open(comp.kwargs.get("file"), "rb") as fh:
+            content = fh.read().decode("utf-8")
+        self.assertNotIn("SECRET", content)
+        self.assertIn('"token":"***"', content)
+        os.remove(comp.kwargs.get("file"))
+
+    async def test_threshold_file_send_failure_falls_back_to_forward(self):
+        data = sample_data(images=[f"https://x.com/{i}.jpg" for i in range(5)])
+        plugin = self._plugin(
+            {"direct_json_enabled": True, "image_count_threshold": 3,
+             "live_photo_count_threshold": 10}
+        )
+        # 仅让「JSON 文件」这一步失败（如 NapCat 读不到本地文件），其余照常成功
+        real_dispatch = plugin._dispatch_send
+
+        async def _fail_file_only(event_, result, label, **kw):
+            if label.endswith("（JSON 文件）"):
+                return "failed"
+            return await real_dispatch(event_, result, label, **kw)
+
+        plugin._dispatch_send = _fail_file_only
+        event = await self._reply(plugin, data)
+        kinds = [k for k, _ in event.sent]
+        self.assertEqual(kinds, ["plain", "chain"])
+        texts = "\n".join(extract_text(event.sent[-1][1][0]))
+        self.assertIn('"code":200', texts)
+
+    async def test_batch_file_oversize_returns_false_without_sending(self):
+        """JSON 超过输出限制时，文件方式直接放弃（不发出任何消息），交由打包消息兜底。"""
+        data = sample_data(images=["https://x.com/1.jpg"])
+        plugin = self._plugin({})
+        plugin._runtime_limits_cfg = lambda: {"json_output_max_bytes": 16}
+        event = _Event()
+        ok = await plugin._send_batch_as_file(
+            event, {"code": 200, "data": data}, "摘要", ("t", 1), "测试"
+        )
+        self.assertFalse(ok)
+        self.assertEqual(event.sent, [])
 
     async def test_threshold_none_config_does_not_crash(self):
         data = sample_data(images=[f"https://x.com/{i}.jpg" for i in range(5)])
@@ -311,7 +386,8 @@ class BatchOutputTests(unittest.IsolatedAsyncioTestCase):
         data = sample_data(images=[f"https://x.com/{i}.jpg" for i in range(5)])
         plugin = self._plugin(
             {"direct_json_enabled": True, "image_count_threshold": "3",
-             "live_photo_count_threshold": "10"}
+             "live_photo_count_threshold": "10"},
+            message_cfg={"batch_full_response_mode": "forward"},
         )
         event = await self._reply(plugin, data)
         joined = "\n".join(extract_text(event.sent[0][1][0]))
@@ -332,7 +408,8 @@ class BatchOutputTests(unittest.IsolatedAsyncioTestCase):
         data = sample_data(extra={"token": "SECRET", "tags": ["t"]})
         plugin = self._plugin(
             {"direct_json_enabled": True, "image_count_threshold": 0,
-             "live_photo_count_threshold": 0}
+             "live_photo_count_threshold": 0},
+            message_cfg={"batch_full_response_mode": "forward"},
         )
         event = await self._reply(plugin, data)
         joined = "\n".join(extract_text(event.sent[0][1][0]))

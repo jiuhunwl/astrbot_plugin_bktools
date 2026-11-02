@@ -29,7 +29,7 @@ import aiohttp
 
 from astrbot.api import logger
 from astrbot.api.event import filter, AstrMessageEvent
-from astrbot.api.message_components import Image, Node, Nodes, Plain, Record, Video
+from astrbot.api.message_components import File, Image, Node, Nodes, Plain, Record, Video
 from astrbot.api.star import Context, Star, register
 from astrbot.core.star.filter.event_message_type import EventMessageType
 
@@ -189,7 +189,7 @@ except ImportError:
     )
 
 
-PLUGIN_VERSION = "1.7.2"
+PLUGIN_VERSION = "1.7.3"
 
 
 def _cfg(root: Any, *keys: str, default: Any = None) -> Any:
@@ -2169,6 +2169,93 @@ class BKToolsPlugin(Star):
         logger.warning("%s，JSON 发送未确认成功（%s），不再重发", reason, outcome)
         return False
 
+    async def _send_batch_as_file(
+        self,
+        event: AstrMessageEvent,
+        payload: Dict[str, Any],
+        header: str,
+        parse_token: Tuple[str, int],
+        reason: str,
+    ) -> bool:
+        """把完整响应保存为 JSON 文件发送（默认批量输出方式）。
+
+        NapCat 对过大的合并转发经常报 retcode 1200（send_forward_msg 失败），
+        文件发送走 upload_file 接口，不经过转发消息通道，稳定性好得多。
+        先发可读摘要卡片（普通文本），再发 JSON 文件。
+
+        返回 False 表示文件方式未成功，调用方应降级为打包消息。
+        """
+        if self._is_parse_cancelled(parse_token):
+            logger.info("%s前收到停止解析指令，取消发送 JSON 文件", reason)
+            return False
+        json_text = json.dumps(
+            _redact_sensitive(payload),
+            ensure_ascii=False,
+            separators=(",", ":"),
+            default=str,
+        )
+        encoded = json_text.encode("utf-8")
+        limits = self._runtime_limits_cfg()
+        json_limit = max(
+            65536,
+            int(
+                limits.get(
+                    "json_output_max_bytes",
+                    limits.get("json_file_max_bytes", 2 * 1024 * 1024),
+                )
+                or 0,
+            ),
+        )
+        if len(encoded) > json_limit:
+            logger.warning(
+                "%s，JSON 大小 %d 字节超过输出限制 %d 字节，改走打包消息",
+                reason, len(encoded), json_limit,
+            )
+            return False
+
+        if header:
+            self._runtime_manager.set_state(TaskState.SENDING)
+            outcome = await self._dispatch_send(
+                event, event.plain_result(header), f"{reason}（摘要卡片）",
+                retry_same_payload=True,
+            )
+            if outcome != "ok":
+                logger.warning("%s，摘要卡片发送未确认成功（%s），改走打包消息", reason, outcome)
+                return False
+            if self._is_parse_cancelled(parse_token):
+                logger.info("%s摘要发送后收到停止解析指令，取消发送 JSON 文件", reason)
+                return False
+
+        stamp = time.strftime("%Y%m%d_%H%M%S")
+        fname = f"BKtools_解析响应_{stamp}_{os.getpid() % 10000}.json"
+        fdir = os.path.join(tempfile.gettempdir(), "bktools_batch")
+        try:
+            os.makedirs(fdir, exist_ok=True)
+            fpath = os.path.join(fdir, fname)
+            with open(fpath, "wb") as fh:
+                fh.write(encoded)
+        except OSError as ex:
+            logger.error("%s，写出 JSON 文件失败: %s", reason, ex)
+            return False
+
+        self._runtime_manager.set_state(TaskState.SENDING)
+        outcome = await self._dispatch_send(
+            event,
+            event.chain_result([File(name=fname, file=fpath)]),
+            f"{reason}（JSON 文件）",
+            retry_same_payload=True,
+        )
+        if outcome == "ok":
+            logger.info("%s，JSON 文件发送成功: %s", reason, fpath)
+            return True
+        logger.warning("%s，JSON 文件发送未确认成功（%s），改走打包消息", reason, outcome)
+        # 发送失败时清掉刚写出的临时文件，避免堆积
+        try:
+            os.remove(fpath)
+        except OSError:
+            pass
+        return False
+
     async def _send_batch_full_response(
         self,
         event: AstrMessageEvent,
@@ -2179,10 +2266,10 @@ class BKToolsPlugin(Star):
         parse_token: Tuple[str, int],
         reason: str,
     ) -> bool:
-        """批量内容超阈值：把接口完整响应作为一条打包消息发送。
+        """批量内容超阈值：把接口完整响应作为文件或打包消息发送。
 
-        打包内容 = 可读摘要卡片（标题/类型/作者/数量/原声/链接…）+ 完整响应分片，
-        避免像旧版那样把整段原始 JSON 直接当普通文本刷到群里。
+        默认（batch_full_response_mode=file）：可读摘要卡片 + JSON 文件。
+        mode=forward：可读摘要卡片 + 完整响应分片的合并转发消息。
         """
         msg_cfg = _cfg(self._runtime_config(), "message", default={}) or {}
         header = ""
@@ -2196,6 +2283,11 @@ class BKToolsPlugin(Star):
             stripped = (link or "").strip()
             if stripped and stripped not in header:
                 header = f"{header.rstrip()}\n原始链接：{stripped}"
+        mode = str(msg_cfg.get("batch_full_response_mode", "file") or "file").strip().lower()
+        if mode == "file" and not self._is_wechat_platform(event):
+            if await self._send_batch_as_file(event, payload, header, parse_token, reason):
+                return True
+            logger.info("%s，JSON 文件方式未成功，降级为打包消息", reason)
         return await self._send_json_result(
             event, payload, parse_token, reason, header_text=header or None
         )
