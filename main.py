@@ -201,7 +201,7 @@ except ImportError:
     )
 
 
-PLUGIN_VERSION = "1.7.11"
+PLUGIN_VERSION = "1.7.12"
 
 
 def _cfg(root: Any, *keys: str, default: Any = None) -> Any:
@@ -484,18 +484,20 @@ def _render_player_card_md(
     quote_bits: List[str] = []
     body: List[str] = []
     for label, value in fields:
+        if label in ("标题", "曲名"):
+            continue  # 已作为卡片标题展示，避免重复一行
         if buttons_enabled and value.startswith(("http://", "https://")):
             continue
         if label in _PLAYER_QUOTE_FIELDS:
             quote_bits.append(f"{label} {value}")
         else:
             body.append(f"**{label}**：{value}")
-    if quote_bits:
-        out.extend(("", "> " + " · ".join(quote_bits)))
     if body:
         if is_music and extra and any("歌词" in e or len(e) > 40 for e in extra):
             body.append("**歌词预览**")
         out.extend(("", *body))
+    if quote_bits:
+        out.extend(("", "> " + " · ".join(quote_bits)))
     if extra:
         out.extend(("", *extra))
     out.extend(("", "***"))
@@ -1033,7 +1035,22 @@ def _management_only(func):
     @wraps(func)
     async def wrapped(self, event: AstrMessageEvent, *args, **kwargs):
         if not await self._is_management_allowed(event):
-            await event.send(event.plain_result("权限不足：该命令仅限授权管理员使用。"))
+            sender = self._event_sender_id(event)
+            scope_id = self._event_group_id(event)
+            logger.info(
+                "管理命令被拒绝：%s，用户=%s，会话=%s",
+                getattr(func, "__name__", "?"), sender, scope_id or "私聊",
+            )
+            lines = ["权限不足：该命令仅限授权管理员使用。", f"你的用户 ID：{sender}"]
+            if scope_id:
+                lines.append(f"当前群 ID：{scope_id}")
+            lines.append(
+                "把上面的用户 ID 加入「插件配置 → security → 全局授权用户 ID」即可。"
+            )
+            lines.append(
+                "注意：QQ 官方机器人拿到的是 openid（不是 QQ 号），所以按 QQ 号填写不会命中。"
+            )
+            await event.send(event.plain_result("\n".join(lines)))
             return None
         return await func(self, event, *args, **kwargs)
 
@@ -2022,15 +2039,37 @@ class BKToolsPlugin(Star):
     def _security_cfg(self) -> Dict[str, Any]:
         return _cfg(self._runtime_config(), "security", default={}) or {}
 
+    @staticmethod
+    def _normalize_admin_ids(raw: Any) -> set:
+        """归一化授权用户 ID：兼容 list 与逗号/空格/分号分隔的字符串。"""
+        items: List[str] = []
+        if isinstance(raw, str):
+            items = re.split(r"[\s,，;；]+", raw)
+        elif isinstance(raw, (list, tuple, set)):
+            for entry in raw:
+                if isinstance(entry, str):
+                    items.extend(re.split(r"[\s,，;；]+", entry))
+                elif entry is not None:
+                    items.append(str(entry))
+        return {str(x).strip() for x in items if str(x).strip()}
+
     async def _is_management_allowed(self, event: AstrMessageEvent) -> bool:
         cfg = self._security_cfg()
         mode = str(cfg.get("management_permission") or "admin_only").lower()
         if mode == "everyone":
             return True
         sender_id = self._event_sender_id(event)
-        configured_admins = {str(x).strip() for x in cfg.get("admin_user_ids", []) if str(x).strip()}
+        configured_admins = self._normalize_admin_ids(cfg.get("admin_user_ids"))
         if sender_id in configured_admins:
             return True
+        # AstrBot 全局管理员：命中 admins_id 时框架会把 event.role 置为 admin。
+        # QQ 官方机器人等平台取不到真实 QQ 号（只有 openid），这条兜底可免去手工填 ID。
+        if mode != "allowlist_only":
+            try:
+                if event.is_admin():
+                    return True
+            except Exception:
+                pass
         if mode == "allowlist_only":
             return False
         if not self._event_group_id(event) or not bool(cfg.get("allow_group_admins", True)):
@@ -2392,8 +2431,7 @@ class BKToolsPlugin(Star):
                     )
                 button_rows: List[Any] = []
                 if header_md:
-                    msg_cfg = _cfg(self._runtime_config(), "message", default={}) or {}
-                    if bool(msg_cfg.get("official_buttons", False)):
+                    if self._official_buttons_enabled(event):
                         button_rows = self._official_button_rows(header_md, link_url or "")
                 sent_any = False
                 for index, piece in enumerate(pieces):
@@ -2648,10 +2686,7 @@ class BKToolsPlugin(Star):
                         first_card = False
                     elif first_card:
                         first_card = False
-                        msg_cfg = (
-                            _cfg(self._runtime_config(), "message", default={}) or {}
-                        )
-                        btn_on = bool(msg_cfg.get("official_buttons", False))
+                        btn_on = self._official_buttons_enabled(event)
                         rows = (
                             self._official_button_rows(text, link_url or "")
                             if btn_on
@@ -3009,6 +3044,23 @@ class BKToolsPlugin(Star):
         except Exception:
             return False
 
+    def _official_buttons_enabled(self, event: AstrMessageEvent) -> bool:
+        """是否尝试发送 keyboard 按钮行。
+
+        默认开启；按钮组件缺失（AstrBot 版本过旧）或最近一次因未授权 keyboard
+        失败时自动跳过，避免每张卡片都先失败一次再降级。
+        """
+        if not _BUTTONS_READY:
+            return False
+        try:
+            block_until = float(getattr(self, "_button_block_until", 0) or 0)
+        except (TypeError, ValueError):
+            block_until = 0.0
+        if time.time() < block_until:
+            return False
+        msg_cfg = _cfg(self._runtime_config(), "message", default={}) or {}
+        return bool(msg_cfg.get("official_buttons", True))
+
     def _text_result(
         self,
         event: AstrMessageEvent,
@@ -3116,6 +3168,8 @@ class BKToolsPlugin(Star):
             ):
                 return outcome
             logger.info("%s，按钮消息发送失败（多为未申请 keyboard 权限），降级为无按钮卡片", label)
+            # 10 分钟内不再尝试按钮，避免每张卡片都先失败一次
+            self._button_block_until = time.time() + 600
         return await self._dispatch_send(
             event,
             self._text_result(event, card_md, markdown=True),
@@ -4192,9 +4246,8 @@ class BKToolsPlugin(Star):
             # 音频/歌词等长链接转为按钮行，卡片发送失败兜底纯文本。
             md_on = self._official_markdown_enabled(event)
             if md_on:
-                msg_cfg_btn = _cfg(self._runtime_config(), "message", default={}) or {}
                 rows: List[Any] = []
-                if bool(msg_cfg_btn.get("official_buttons", False)):
+                if self._official_buttons_enabled(event):
                     rows = self._official_button_rows(text, req_link or "")
                 card_md = _render_player_card_md(
                     text, cover_url=str(cover or ""), buttons_enabled=bool(rows)
@@ -4512,7 +4565,7 @@ class BKToolsPlugin(Star):
             checks.append(
                 "ℹ️ 输出配置："
                 f"official_markdown={bool(msg_cfg_diag.get('official_markdown', True))}"
-                f"，official_buttons={bool(msg_cfg_diag.get('official_buttons', False))}"
+                f"，official_buttons={bool(msg_cfg_diag.get('official_buttons', True))}"
                 f"，pack_forward={bool(msg_cfg_diag.get('pack_forward', True))}"
             )
             if caps.get("markdown") or caps.get("name") == "qq_official":
@@ -4566,7 +4619,6 @@ class BKToolsPlugin(Star):
                 )
             )
             return
-        msg_cfg = _cfg(self._runtime_config(), "message", default={}) or {}
         cover = str(image_url or "").strip()
         if cover and not cover.startswith(("http://", "https://")):
             cover = ""
@@ -4575,12 +4627,14 @@ class BKToolsPlugin(Star):
                 "标题：卡片渲染测试",
                 "作者：BKtools",
                 f"平台：{caps.get('name')}",
-                "时长：00:20 · 大小：1.20MB · 画质：original",
+                "时长：00:20",
+                "大小：1.20MB",
+                "画质：original",
                 "原声：BKtools 创作的原声",
                 "视频直链：https://example.com/bktools-card-test.mp4",
             ]
         )
-        btn_on = bool(msg_cfg.get("official_buttons", False))
+        btn_on = self._official_buttons_enabled(event)
         rows = self._official_button_rows(sample, "") if btn_on else []
         card_md = _render_player_card_md(
             sample, cover_url=cover, buttons_enabled=bool(rows)
@@ -4589,6 +4643,7 @@ class BKToolsPlugin(Star):
             "BKtools v%s 卡片测试：平台=%s，Markdown API=%s，按钮=%s，封面=%s",
             PLUGIN_VERSION, caps.get("name"), True, bool(rows), bool(cover),
         )
+        block_before = float(getattr(self, "_button_block_until", 0) or 0)
         if rows:
             outcome = await self._send_official_card(
                 event, card_md, rows, "卡片测试"
@@ -4605,6 +4660,13 @@ class BKToolsPlugin(Star):
                 event.plain_result(
                     "卡片发送失败，已按纯文本兜底。常见原因：机器人未获得 Markdown/keyboard "
                     "权限，或 AstrBot 适配器版本过旧（详见 AstrBot 日志）。"
+                )
+            )
+        elif rows and float(getattr(self, "_button_block_until", 0) or 0) > block_before:
+            await event.send(
+                event.plain_result(
+                    "按钮发送失败（多为未申请 keyboard 权限），已降级为无按钮卡片。"
+                    "开通权限后 10 分钟内会自动重试。"
                 )
             )
 

@@ -892,7 +892,9 @@ class OfficialMarkdownTests(unittest.IsolatedAsyncioTestCase):
         )
         self.assertTrue(sent_any)
         self.assertEqual(len(event.sent), 2)
-        self.assertIn("**标题**：测试视频", event.sent[0].text)
+        # 标题已作为卡片头部，正文不再重复「标题」字段行
+        self.assertIn("## 🎬 测试视频", event.sent[0].text)
+        self.assertNotIn("**标题**", event.sent[0].text)
         self.assertEqual(event.sent[0].markdown, True)
 
 
@@ -1222,6 +1224,78 @@ class MarkdownApiProbeTests(unittest.TestCase):
         self.assertFalse(
             plugin._official_markdown_enabled(_EventOnPlatform("aiocqhttp"))
         )
+
+
+class PlayerCardLayoutTests(unittest.TestCase):
+    """播放器卡片版式：标题不重复、元信息排在正文之后。"""
+
+    def test_title_not_duplicated_in_body(self):
+        out = bk._render_player_card_md("标题：测试视频\n作者：小明")
+        self.assertTrue(out.startswith("## 🎬 测试视频"))
+        self.assertNotIn("**标题**", out)
+
+    def test_music_title_not_duplicated(self):
+        out = bk._render_player_card_md("曲名：晴天\n艺人：周杰伦\n音频：https://x.com/a.mp3")
+        self.assertTrue(out.startswith("## 🎵 晴天"))
+        self.assertNotIn("**曲名**", out)
+
+    def test_meta_quote_after_body(self):
+        out = bk._render_player_card_md("标题：T\n作者：A\n时长：01:00")
+        self.assertLess(out.index("**作者**"), out.index("> 时长"))
+
+    def test_buttons_remove_url_lines(self):
+        text = "标题：T\n视频直链：https://x.com/v.mp4"
+        without = bk._render_player_card_md(text, buttons_enabled=False)
+        with_btn = bk._render_player_card_md(text, buttons_enabled=True)
+        self.assertIn("https://x.com/v.mp4", without)
+        self.assertNotIn("https://x.com/v.mp4", with_btn)
+
+
+class ManagementPermissionTests(unittest.IsolatedAsyncioTestCase):
+    """管理权限：ID 归一化、AstrBot 全局管理员兜底、openid 白名单。"""
+
+    def _plugin(self, security=None):
+        return bk.BKToolsPlugin(
+            object(),
+            {
+                "message": {"opening_enable": False},
+                "security": {"management_permission": "admin_only", **(security or {})},
+                "video_threshold": {"threshold_enabled": False},
+            },
+        )
+
+    def test_normalize_admin_ids(self):
+        norm = bk.BKToolsPlugin._normalize_admin_ids
+        self.assertEqual(norm("1, 2，3\n4"), {"1", "2", "3", "4"})
+        self.assertEqual(norm([1, "2", ""]), {"1", "2"})
+        self.assertEqual(norm(None), set())
+        self.assertEqual(norm(""), set())
+
+    async def test_global_admin_allowed(self):
+        class _AdminEvent(_EventOnPlatform):
+            def is_admin(self):
+                return True
+
+        plugin = self._plugin()
+        self.assertTrue(await plugin._is_management_allowed(_AdminEvent("qq_official")))
+
+    async def test_allowlist_only_ignores_global_admin(self):
+        class _AdminEvent(_EventOnPlatform):
+            def is_admin(self):
+                return True
+
+        plugin = self._plugin({"management_permission": "allowlist_only"})
+        self.assertFalse(await plugin._is_management_allowed(_AdminEvent("qq_official")))
+
+    async def test_openid_in_allowlist(self):
+        class _OpenidEvent(_EventOnPlatform):
+            def get_sender_id(self):
+                return "A1B2C3D4E5"
+
+        plugin = self._plugin(
+            {"management_permission": "allowlist_only", "admin_user_ids": ["A1B2C3D4E5"]}
+        )
+        self.assertTrue(await plugin._is_management_allowed(_OpenidEvent("qq_official")))
 
 
 if __name__ == "__main__":

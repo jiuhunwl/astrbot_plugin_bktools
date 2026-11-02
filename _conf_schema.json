@@ -264,7 +264,7 @@
         "description": "全局授权用户 ID",
         "type": "list",
         "default": [],
-        "hint": "每行填写一个用户 ID。授权用户可在群聊和私聊中执行管理命令。"
+        "hint": "每行填写一个用户 ID。QQ 官方机器人返回的是 openid（不是 QQ 号），把「权限不足」提示里显示的用户 ID 原样粘进来即可；NapCat/aiocqhttp 等平台填 QQ 号。AstrBot 全局管理员（admins_id）会被自动放行，无需重复填写。"
       },
       "max_concurrent_tasks_per_scope": {
         "description": "每个群/私聊最大并发解析数",
@@ -486,8 +486,8 @@
       "official_buttons": {
         "description": "官方机器人摘要按钮",
         "type": "bool",
-        "default": false,
-        "hint": "官方机器人输出升级为卡片+按钮：摘要卡片附带跳转按钮行，「原始链接」排最前，卡片里的视频直链/原声链接/音频直链/歌词链接等链接行也会自动变为对应按钮（单行最多 5 个，超 1024 字节的直链自动跳过）。正常解析、批量输出摘要、音乐解析三条路径均生效。需要官方机器人在 QQ 开放平台申请 keyboard 按钮权限，未授权时发送会失败并自动降级为无按钮卡片；需 AstrBot 较新版本（含按钮组件）。默认关闭。"
+        "default": true,
+        "hint": "卡片底部附带跳转按钮（inline keyboard）：播放视频/播放原声/歌词等，单击直接跳转。需要官方机器人在 QQ 开放平台申请键盘（keyboard）权限；未授权时首次发送会失败并自动降级为无按钮卡片，之后 10 分钟内不再重试。默认开启。"
       },
       "max_images_per_work": {
         "description": "每个作品最多展示图片数",
