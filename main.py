@@ -201,7 +201,7 @@ except ImportError:
     )
 
 
-PLUGIN_VERSION = "1.7.10"
+PLUGIN_VERSION = "1.7.11"
 
 
 def _cfg(root: Any, *keys: str, default: Any = None) -> Any:
@@ -2978,6 +2978,18 @@ class BKToolsPlugin(Star):
         )
         return caps
 
+    def _markdown_api_available(self, event: AstrMessageEvent) -> bool:
+        """当前 AstrBot 版本的 MessageChain 是否支持 use_markdown 标记。
+
+        早于原生 Markdown 支持的 AstrBot 没有该方法，此时强行发送 Markdown
+        语法只会把 `##`、`**`、`![]()` 原样显示出来，观感比纯文本更差，因此
+        探测不到就直接关闭 Markdown 排版。
+        """
+        try:
+            return hasattr(event.plain_result(""), "use_markdown")
+        except Exception:
+            return False
+
     def _official_markdown_enabled(self, event: AstrMessageEvent) -> bool:
         """官方机器人（qq_official 系）是否启用 Markdown 排版输出。
 
@@ -2989,6 +3001,8 @@ class BKToolsPlugin(Star):
         try:
             caps = self._adapter_caps(event)
             if not caps.get("markdown"):
+                return False
+            if not self._markdown_api_available(event):
                 return False
             msg_cfg = _cfg(self._runtime_config(), "message", default={}) or {}
             return bool(msg_cfg.get("official_markdown", True))
@@ -4486,6 +4500,21 @@ class BKToolsPlugin(Star):
         # 官方机器人（qq_official 系）环境自检：版本 / Markdown / 全量消息指引
         try:
             caps = self._adapter_caps(event)
+            msg_cfg_diag = _cfg(cfg, "message", default={}) or {}
+            checks.append(
+                f"ℹ️ 平台适配器：{caps.get('name') or '未知'}"
+                f"｜合并转发{'✓' if caps.get('forward') else '✗'}"
+                f"｜文件{'✓' if caps.get('file') else '✗'}"
+                f"｜Markdown{'✓' if caps.get('markdown') else '✗'}"
+                f"｜Markdown API{'✓' if self._markdown_api_available(event) else '✗'}"
+                f"｜按钮组件{'✓' if _BUTTONS_READY else '✗'}"
+            )
+            checks.append(
+                "ℹ️ 输出配置："
+                f"official_markdown={bool(msg_cfg_diag.get('official_markdown', True))}"
+                f"，official_buttons={bool(msg_cfg_diag.get('official_buttons', False))}"
+                f"，pack_forward={bool(msg_cfg_diag.get('pack_forward', True))}"
+            )
             if caps.get("markdown") or caps.get("name") == "qq_official":
                 md_on = self._official_markdown_enabled(event)
                 checks.append(
@@ -4496,9 +4525,88 @@ class BKToolsPlugin(Star):
                     "ℹ️ 非@消息：需在 QQ 开放平台开通「接收所有消息」，且群主在群设置"
                     "里把机器人消息范围改为「接收全部消息」，否则群里必须 @ 机器人才触发"
                 )
+                checks.append("ℹ️ 渲染自检：发送 /bk卡片测试 可直接验证 Markdown 与按钮是否生效")
         except Exception:
             pass
         await event.send(event.plain_result("【BKtools 诊断】\n" + "\n".join(checks)))
+
+    @filter.command("bk卡片测试")
+    @_event_scoped()
+    @_management_only
+    async def cmd_card_test(self, event: AstrMessageEvent, image_url: str = ""):
+        """发送一张官方机器人 Markdown 卡片样张，验证渲染与按钮权限。
+
+        用法：/bk卡片测试 [封面图片URL]
+        - 渲染成「标题 + 内嵌封面 + 加粗字段 + 引用块 + 分割线」说明 Markdown 生效；
+        - 若看到 `##`、`**`、`![]()` 原样出现，说明适配器/平台未启用 Markdown；
+        - 开启 message.official_buttons 时样张会附带按钮，用于验证 keyboard 权限。
+        """
+        caps = self._adapter_caps(event)
+        if not caps.get("markdown"):
+            await event.send(
+                event.plain_result(
+                    f"当前平台「{caps.get('name') or '未知'}」不是 QQ 官方机器人，"
+                    "Markdown 卡片不适用；其他平台使用原有卡片输出。"
+                )
+            )
+            return
+        if not self._markdown_api_available(event):
+            await event.send(
+                event.plain_result(
+                    "当前 AstrBot 版本的 MessageChain 不支持 use_markdown 标记，"
+                    "发不出 Markdown 卡片。请升级 AstrBot 后重试（插件要求 v4.10.4+）。"
+                )
+            )
+            return
+        md_on = self._official_markdown_enabled(event)
+        if not md_on:
+            await event.send(
+                event.plain_result(
+                    "Markdown 排版已被关闭：请在 WebUI 插件配置 message.official_markdown 中开启。"
+                )
+            )
+            return
+        msg_cfg = _cfg(self._runtime_config(), "message", default={}) or {}
+        cover = str(image_url or "").strip()
+        if cover and not cover.startswith(("http://", "https://")):
+            cover = ""
+        sample = "\n".join(
+            [
+                "标题：卡片渲染测试",
+                "作者：BKtools",
+                f"平台：{caps.get('name')}",
+                "时长：00:20 · 大小：1.20MB · 画质：original",
+                "原声：BKtools 创作的原声",
+                "视频直链：https://example.com/bktools-card-test.mp4",
+            ]
+        )
+        btn_on = bool(msg_cfg.get("official_buttons", False))
+        rows = self._official_button_rows(sample, "") if btn_on else []
+        card_md = _render_player_card_md(
+            sample, cover_url=cover, buttons_enabled=bool(rows)
+        )
+        logger.info(
+            "BKtools v%s 卡片测试：平台=%s，Markdown API=%s，按钮=%s，封面=%s",
+            PLUGIN_VERSION, caps.get("name"), True, bool(rows), bool(cover),
+        )
+        if rows:
+            outcome = await self._send_official_card(
+                event, card_md, rows, "卡片测试"
+            )
+        else:
+            outcome = await self._dispatch_send(
+                event,
+                self._text_result(event, card_md, markdown=True),
+                "卡片测试",
+                retry_same_payload=True,
+            )
+        if outcome != "ok":
+            await event.send(
+                event.plain_result(
+                    "卡片发送失败，已按纯文本兜底。常见原因：机器人未获得 Markdown/keyboard "
+                    "权限，或 AstrBot 适配器版本过旧（详见 AstrBot 日志）。"
+                )
+            )
 
     @filter.command("bk帮助")
     @_event_scoped()
@@ -4516,6 +4624,7 @@ class BKToolsPlugin(Star):
                 "· /bk开放Key、/bk活动 — 校验开放 API Key、查看活动配置（管理员）\n"
                 "· /bk状态 — 查看当前群有效配置与任务状态（管理员）\n"
                 "· /bk诊断 — 检查接口、依赖和安全防护（管理员）\n"
+                "· /bk卡片测试 [封面URL] — 发送官方机器人 Markdown 卡片样张（管理员）\n"
                 "· /bk版本 — 查看当前版本和更新仓库\n"
                 "· /bk检查更新 — 检查 GitHub 新版本（管理员）\n"
                 "· /bk更新插件 — 从官方 GitHub 仓库安全更新（管理员）\n"

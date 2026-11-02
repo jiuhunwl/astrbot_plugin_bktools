@@ -25,6 +25,11 @@ class _Component:
         # 真实 Plain/组件有 text 属性（_send_forward_as_plain 依赖它读取文本）
         self.text = kwargs.get("text", args[0] if args else "")
 
+    def use_markdown(self, use=True):
+        """真实 MessageChain 的 Markdown 标记方法（能力探测依赖它）。"""
+        self.markdown = bool(use)
+        return self
+
     @classmethod
     def fromURL(cls, url):
         return cls(url)
@@ -65,6 +70,19 @@ def _load_main():
 bk = _load_main()
 
 
+class _ResultTuple(tuple):
+    """模拟 MessageChain：保留 (kind, payload) 元组行为并支持 use_markdown。"""
+
+    def __new__(cls, kind, payload):
+        obj = super().__new__(cls, (kind, payload))
+        obj.markdown = None
+        return obj
+
+    def use_markdown(self, use=True):
+        self.markdown = bool(use)
+        return self
+
+
 class _Event:
     def __init__(self):
         self.sent = []
@@ -76,10 +94,10 @@ class _Event:
         return "10000"
 
     def plain_result(self, text):
-        return ("plain", text)
+        return _ResultTuple("plain", text)
 
     def chain_result(self, content):
-        return ("chain", content)
+        return _ResultTuple("chain", content)
 
     async def send(self, result):
         self.sent.append(result)

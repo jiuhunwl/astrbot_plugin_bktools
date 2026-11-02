@@ -4,6 +4,20 @@
 
 格式参考 Keep a Changelog，并遵循语义化版本管理思路。
 
+## [v1.7.11] - 2026-11-02
+
+### Added
+
+- 新增 `/bk卡片测试 [封面URL]`（管理员）：发送一张官方机器人 Markdown 卡片样张，
+  用于单独验证 Markdown 渲染、封面内嵌与按钮 keyboard 权限，不依赖解析流程。
+- `/bk诊断` 增加平台适配器能力明细（平台名 / 合并转发 / 文件 / Markdown / Markdown API）
+  与输出配置快照（official_markdown、official_buttons、pack_forward）。
+
+### Fixed
+
+- 若 AstrBot 版本的 MessageChain 不支持 `use_markdown`，自动关闭 Markdown 排版并
+  退回纯文本卡片，避免把 `##`、`**`、`![]()` 等语法原样发给用户。
+
 ## [v1.7.10] - 2026-11-02
 
 ### Added

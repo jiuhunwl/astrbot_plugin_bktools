@@ -1,6 +1,34 @@
 # astrbot_plugin_bktools（BKtools）
 
-当前版本：`v1.7.10`，要求 AstrBot `v4.10.4+`，已验证兼容 AstrBot `v4.25.5`。
+当前版本：`v1.7.11`，要求 AstrBot `v4.10.4+`，已验证兼容 AstrBot `v4.25.5`。
+
+## v1.7.11 卡片自检与官方机器人配置指引
+
+- 新增 `/bk卡片测试 [封面URL]`（管理员）：直接发一张 Markdown 卡片样张，用来单独验证
+  「Markdown 是否渲染 / 封面能否内嵌 / 按钮 keyboard 权限是否可用」，与解析流程解耦
+- `/bk诊断` 增加平台适配器能力明细与输出配置快照，可一眼看出当前是否被判为官方机器人、
+  Markdown 能力位是否打开、`official_markdown` / `official_buttons` 实际取值
+- AstrBot 老版本不支持 `use_markdown` 时自动关闭 Markdown 排版，避免把 `##`、`**`、`![]()`
+  原样发出去
+
+### 官方机器人配置清单（插件侧）
+
+| 配置项 | 建议值 | 说明 |
+| --- | --- | --- |
+| `message.pack_forward` | `true` | 必须开启才会走「卡片 + 按钮」路径 |
+| `message.official_markdown` | `true` | 官方机器人卡片版式总开关 |
+| `message.official_buttons` | `true` | 卡片底部按钮，需开放平台 keyboard 权限；失败自动降级为无按钮卡片 |
+| `message.pack_include_cover` | `true` | 封面会内嵌进卡片；关闭则卡片无图 |
+| `message.custom_adapter_caps` | 留空 | 仅自定义适配器需要，内置换算已覆盖 `qq_official` |
+
+### 官方机器人配置清单（QQ 开放平台侧）
+
+1. 机器人管理端开启「**接收所有消息**」（群消息全量模式 `GROUP_MESSAGE_CREATE`），否则群里
+   必须 @ 机器人才能触发解析；
+2. 目标群由**群主**在「群设置 → 机器人 → 消息范围」改为「**接收群内全部消息**」，每个群单独设置；
+3. 在开放平台申请 **keyboard 按钮**权限（否则按钮消息发送失败，插件自动降级为无按钮卡片）；
+4. 原生 Markdown 已于 2026/04 对全部机器人开放，无需单独申请模板；
+5. 修改上述配置后需**重启 AstrBot 进程**（上传 zip 只解压文件，Python 不会重新加载已导入模块）。
 
 ## v1.7.8 官方机器人播放器卡片
 

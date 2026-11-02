@@ -1189,5 +1189,40 @@ class PlayerCardSendTests(unittest.IsolatedAsyncioTestCase):
         self.assertIn("标题：测试视频", event.sent[0].text)
 
 
+class MarkdownApiProbeTests(unittest.TestCase):
+    """AstrBot 老版本无 use_markdown 时应自动关闭 Markdown 排版。"""
+
+    def _plugin(self):
+        return bk.BKToolsPlugin(
+            object(),
+            {
+                "message": {"opening_enable": False},
+                "video_threshold": {"threshold_enabled": False},
+            },
+        )
+
+    def test_missing_use_markdown_disables_card(self):
+        class _Bare(_EventOnPlatform):
+            def plain_result(self, text):
+                return ("plain", text)
+
+        plugin = self._plugin()
+        event = _Bare("qq_official")
+        self.assertFalse(plugin._markdown_api_available(event))
+        self.assertFalse(plugin._official_markdown_enabled(event))
+
+    def test_supported_api_enables_card(self):
+        plugin = self._plugin()
+        event = _EventOnPlatform("qq_official")
+        self.assertTrue(plugin._markdown_api_available(event))
+        self.assertTrue(plugin._official_markdown_enabled(event))
+
+    def test_non_official_platform_never_markdown(self):
+        plugin = self._plugin()
+        self.assertFalse(
+            plugin._official_markdown_enabled(_EventOnPlatform("aiocqhttp"))
+        )
+
+
 if __name__ == "__main__":
     unittest.main()
