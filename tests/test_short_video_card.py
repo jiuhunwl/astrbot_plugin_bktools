@@ -860,11 +860,11 @@ class OfficialMarkdownTests(unittest.IsolatedAsyncioTestCase):
         first = event.sent[0]
         self.assertEqual(first.kind, "chain")
         self.assertEqual(first.markdown, True)
-        # [Plain 卡片, ActionRow 按钮行]
+        # [Plain 播放器卡片, ActionRow 按钮行]
         self.assertEqual(len(first.content), 2)
         labels = [b.label for b in first.content[1].buttons]
-        self.assertEqual(labels[0], "原始链接")
-        self.assertIn("视频直链", labels)
+        self.assertEqual(labels[0], "🔗 原始链接")
+        self.assertIn("▶ 播放视频", labels)
 
     async def test_buttons_default_off_no_button_message(self):
         """默认配置不开按钮：只有纯摘要消息，没有 chain 形态按钮消息。"""
@@ -941,9 +941,9 @@ class OfficialButtonRowsTests(unittest.TestCase):
         rows = self._rows(plugin, card, "https://v.douyin.com/abc")
         self.assertEqual(len(rows), 1)
         labels = [b.label for b in rows[0].buttons]
-        self.assertEqual(labels[0], "原始链接")
-        self.assertIn("音频直链", labels)
-        self.assertIn("歌词链接", labels)
+        self.assertEqual(labels[0], "🔗 原始链接")
+        self.assertIn("▶ 播放音乐", labels)
+        self.assertIn("📄 歌词", labels)
         urls = [b.action.url for b in rows[0].buttons]
         self.assertEqual(urls[0], "https://v.douyin.com/abc")
 
@@ -953,7 +953,7 @@ class OfficialButtonRowsTests(unittest.TestCase):
         card = "视频直链：https://x.com/" + "a" * 2000
         rows = self._rows(plugin, card, "https://v.douyin.com/abc")
         labels = [b.label for b in rows[0].buttons]
-        self.assertEqual(labels, ["原始链接"])
+        self.assertEqual(labels, ["🔗 原始链接"])
 
     def test_components_missing_returns_empty(self):
         """AstrBot 无按钮组件（_BUTTONS_READY False）→ 空列表自动停用。"""
@@ -1078,6 +1078,115 @@ class MusicV2FormatTests(unittest.TestCase):
         text = bk._summarize_music_qualities(qs)
         self.assertTrue(text.endswith("等共7档"))
         self.assertEqual(text.count(" / "), 4)  # 最多 5 项
+
+
+class PlayerCardRenderTests(unittest.TestCase):
+    """QQ 官方机器人播放器卡片 Markdown 渲染（v1.7.8）。"""
+
+    def test_video_card_header_image_quote(self):
+        text = (
+            "标题：测试视频\n类型：视频\n作者：BugPk\n时长：01:20\n"
+            "大小：1.74MB\n画质：original\n视频直链：https://x.com/v.mp4\n"
+            "原始链接：https://v.douyin.com/abc/"
+        )
+        out = bk._render_player_card_md(
+            text, cover_url="https://x.com/cover.jpg", buttons_enabled=True,
+        )
+        self.assertTrue(out.startswith("## 🎬 测试视频"))
+        self.assertIn("![cover #560px #315px](https://x.com/cover.jpg)", out)
+        self.assertIn("> 时长 01:20 · 大小 1.74MB · 画质 original", out)
+        self.assertIn("**作者**：BugPk", out)
+        # 按钮开启时长链接行从正文移除，结尾为分割线
+        self.assertNotIn("https://x.com/v.mp4", out)
+        self.assertNotIn("https://v.douyin.com/abc/", out)
+        self.assertTrue(out.endswith("***"))
+
+    def test_music_card_square_image_keep_urls_without_buttons(self):
+        text = (
+            "平台：网易云\n曲名：歌\n艺人：A\n时长：04:12（试听片段）\n"
+            "音频：https://m.example.com/a.mp3"
+        )
+        out = bk._render_player_card_md(text, cover_url="https://x.com/c.jpg")
+        self.assertIn("## 🎵 歌", out)
+        self.assertIn("![cover #300px #300px](https://x.com/c.jpg)", out)
+        self.assertIn("**艺人**：A", out)
+        self.assertIn("**音频**：https://m.example.com/a.mp3", out)
+
+    def test_no_fields_falls_back_to_markdownize(self):
+        text = "自由文本没有字段行"
+        self.assertEqual(
+            bk._render_player_card_md(text), bk._markdownize_card_text(text)
+        )
+
+    def test_long_title_truncated(self):
+        text = "标题：" + "长" * 40
+        out = bk._render_player_card_md(text)
+        header = out.splitlines()[0]
+        self.assertTrue(header.startswith("## 🎬 "))
+        self.assertTrue(header.endswith("…"))
+        # 头部截断到 32 字（加 emoji 前缀后整行不超过 40 字符）
+        self.assertLessEqual(len(header), 40)
+
+
+class PlayerCardSendTests(unittest.IsolatedAsyncioTestCase):
+    """播放器卡片发送：封面内嵌跳过重复图片、卡片失败兜底纯文本。"""
+
+    def _plugin(self, message_cfg=None):
+        cfg = {"opening_enable": False, "short_video_text_metadata": True}
+        cfg.update(message_cfg or {})
+        return bk.BKToolsPlugin(
+            object(),
+            {"message": cfg, "video_threshold": {"threshold_enabled": False}},
+        )
+
+    async def test_embedded_cover_image_not_resent(self):
+        """封面已内嵌卡片时，不再单独发送同 URL 的 Image 组件。"""
+        plugin = self._plugin()
+
+        class _Plain:
+            """独立 Plain 类（桩的 Plain/Image 同类，无法区分组件类型）。"""
+
+            def __init__(self, text=""):
+                self.text = text
+
+        card = _Plain("标题：测试视频")
+        img = bk.Image("https://x.com/1.jpg")
+        img.url = "https://x.com/1.jpg"
+        nodes = [
+            bk.Node(name="B", uin=10000, content=[card]),
+            bk.Node(name="B", uin=10000, content=[img]),
+        ]
+        event = _MDEvent("qq_official")
+        with patch.object(bk, "Plain", _Plain):
+            sent_any = await plugin._send_forward_as_plain(
+                event, nodes, ("t", 0), "测试降级"
+            )
+        self.assertTrue(sent_any)
+        # 仅播放器卡片一条消息；Image 未重复发送
+        self.assertEqual(len(event.sent), 1)
+        self.assertIn("![cover #560px #315px](https://x.com/1.jpg)", event.sent[0].text)
+
+    async def test_card_failure_falls_back_to_plain_text(self):
+        """播放器卡片发送失败（如图片转存失败）时兜底纯文本重发。"""
+        plugin = self._plugin()
+        card = bk.Plain()
+        card.text = "标题：测试视频"
+        nodes = [bk.Node(name="B", uin=10000, content=[card])]
+        event = _MDEvent("qq_official")
+
+        async def send(result):
+            if result.markdown is True:  # Markdown 卡片模拟发送失败
+                raise RuntimeError("media transfer failed")
+            event.sent.append(result)
+
+        event.send = send
+        sent_any = await plugin._send_forward_as_plain(
+            event, nodes, ("t", 0), "测试降级"
+        )
+        self.assertTrue(sent_any)
+        self.assertEqual(len(event.sent), 1)
+        self.assertEqual(event.sent[0].markdown, None)  # 纯文本兜底
+        self.assertIn("标题：测试视频", event.sent[0].text)
 
 
 if __name__ == "__main__":

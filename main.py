@@ -201,7 +201,7 @@ except ImportError:
     )
 
 
-PLUGIN_VERSION = "1.7.7"
+PLUGIN_VERSION = "1.7.8"
 
 
 def _cfg(root: Any, *keys: str, default: Any = None) -> Any:
@@ -405,6 +405,100 @@ def _markdownize_card_text(text: str) -> str:
             out.append(f"**{m.group(1)}**：{m.group(2)}")
         else:
             out.append(line)
+    return "\n".join(out)
+
+
+# 官方机器人播放器卡片：URL 字段行 → 按钮 emoji 文案（label 上限 10 字符）
+_PLAYER_BUTTON_LABELS = {
+    "视频直链": "▶ 播放视频",
+    "原声链接": "🎵 播放原声",
+    "音频": "▶ 播放音乐",
+    "音频直链": "▶ 播放音乐",
+    "歌词链接": "📄 歌词",
+    "原始链接": "🔗 原始链接",
+    "主页链接": "🏠 主页",
+}
+_PLAYER_MUSIC_FIELDS = ("曲名", "音频")
+_PLAYER_QUOTE_FIELDS = ("时长", "大小", "画质", "音质")
+
+
+def _qq_md_image(url: str, width: int, height: int) -> str:
+    """QQ 原生 Markdown 内嵌图片语法（开放平台自动转存公网图片）。
+
+    官方文档格式：![text #宽度px #高度px](图片URL)；URL 非 http(s) 返回空串。
+    """
+    u = str(url or "").strip()
+    if not u.startswith(("http://", "https://")):
+        return ""
+    return f"![cover #{int(width)}px #{int(height)}px]({u})"
+
+
+def _render_player_card_md(
+    text: str,
+    *,
+    cover_url: str = "",
+    buttons_enabled: bool = False,
+) -> str:
+    """把摘要卡片文本渲染为 QQ 官方机器人「播放器卡片」Markdown。
+
+    版式（仅官方原生 Markdown 场景使用，语法见 QQ 开放平台文档）：
+    - `## 🎬/🎵 标题` 头部（按 卡片是否含 曲名/音频 字段自动识别音乐）；
+    - 可选内嵌封面图（视频 560x315、音乐 300x300，开放平台转存公网图片）；
+    - 短字段 **加粗** 行；时长/大小/画质/音质收进块引用行；
+    - buttons_enabled=True 时 URL 行从正文移除（由 keyboard 按钮代替，
+      避免长链接换行破坏版式）；False 时保留为 `**标签**：<URL>` 可点击；
+    - 结尾 `***` 分割线。解析失败时退回 Markdownize 结果。
+    """
+    fields: List[Tuple[str, str]] = []
+    extra: List[str] = []
+    for line in str(text).splitlines():
+        s = line.strip()
+        if not s:
+            continue
+        if s[:1] in ("{", "[", '"'):
+            extra.append(s)
+            continue
+        m = _MD_FIELD_LINE_RE.match(s)
+        if m and "://" not in m.group(1):
+            fields.append((m.group(1).strip("*"), m.group(2).strip()))
+        else:
+            extra.append(s)
+    if not fields:
+        return _markdownize_card_text(text)
+    label_set = {label for label, _ in fields}
+    is_music = any(key in label_set for key in _PLAYER_MUSIC_FIELDS)
+    title = ""
+    for key in ("曲名", "标题"):
+        for label, value in fields:
+            if label == key and value and value != "—":
+                title = " ".join(value.split())
+                break
+        if title:
+            break
+    if len(title) > 32:
+        title = title[:32] + "…"
+    out: List[str] = [f"## {'🎵' if is_music else '🎬'} {title or '播放卡片'}"]
+    img = _qq_md_image(cover_url, 300 if is_music else 560, 300 if is_music else 315)
+    if img:
+        out.extend(("", img))
+    quote_bits: List[str] = []
+    body: List[str] = []
+    for label, value in fields:
+        if buttons_enabled and value.startswith(("http://", "https://")):
+            continue
+        if label in _PLAYER_QUOTE_FIELDS:
+            quote_bits.append(f"{label} {value}")
+        else:
+            body.append(f"**{label}**：{value}")
+    if quote_bits:
+        out.extend(("", "> " + " · ".join(quote_bits)))
+    if body:
+        if is_music and extra and any("歌词" in e or len(e) > 40 for e in extra):
+            body.append("**歌词预览**")
+        out.extend(("", *body))
+    if extra:
+        out.extend(("", *extra))
+    out.extend(("", "***"))
     return "\n".join(out)
 
 
@@ -2507,11 +2601,24 @@ class BKToolsPlugin(Star):
         微信系 / QQ 官方机器人等平台不支持 Nodes，每个 Node 的 content 为
         组件列表（Plain/Image/Video 等），逐个组件独立发送；任一发送失败不
         阻断后续节点（尽力而为），期间可响应停止指令。
-        官方机器人：首个文本卡片按 Markdown 排版发送，开启
-        message.official_buttons 时附加跳转按钮行（卡片+按钮形态）。
+        官方机器人：首个文本卡片渲染为播放器卡片（内嵌封面图 + 加粗字段 +
+        块引用元信息），开启 message.official_buttons 时长链接转为按钮行，
+        卡片发送失败自动兜底纯文本重发。
         """
         sent_any = False
         first_card = True
+        cover_url = ""
+        # 预扫描首个公网图片组件作为卡片内嵌封面（短视频封面/音乐封面/图集首图）
+        for node in forward_nodes:
+            content = getattr(node, "content", None)
+            for comp in content if isinstance(content, list) else ():
+                if isinstance(comp, Image):
+                    u = str(getattr(comp, "url", "") or "").strip()
+                    if u.startswith(("http://", "https://")):
+                        cover_url = u
+                        break
+            if cover_url:
+                break
         for node in forward_nodes:
             if self._is_parse_cancelled(parse_token):
                 logger.info("%s降级发送过程中收到停止指令", label)
@@ -2523,28 +2630,63 @@ class BKToolsPlugin(Star):
                     logger.info("%s降级发送过程中收到停止指令", label)
                     return sent_any
                 if isinstance(comp, Plain):
-                    # 文本卡片：官方机器人启用 Markdown 时加粗字段标签后发送；
+                    # 文本卡片：官方机器人启用 Markdown 时渲染播放器卡片；
                     # 其余平台保持与旧版一致的纯文本行为
                     text = str(getattr(comp, "text", "") or "")
                     md_on = self._official_markdown_enabled(event)
-                    card_md = _markdownize_card_text(text) if md_on else text
-                    if first_card:
+                    if not md_on:
+                        send_result = self._text_result(event, text)
+                        first_card = False
+                    elif first_card:
                         first_card = False
                         msg_cfg = (
                             _cfg(self._runtime_config(), "message", default={}) or {}
                         )
-                        if bool(msg_cfg.get("official_buttons", False)):
-                            rows = self._official_button_rows(card_md, link_url or "")
-                            if rows:
-                                outcome = await self._send_official_card(
-                                    event, card_md, rows, f"{label}卡片",
-                                    parse_token=parse_token,
-                                )
-                                if outcome == "ok":
-                                    sent_any = True
-                                continue
-                    send_result = self._text_result(event, card_md)
+                        btn_on = bool(msg_cfg.get("official_buttons", False))
+                        rows = (
+                            self._official_button_rows(text, link_url or "")
+                            if btn_on
+                            else []
+                        )
+                        card_md = _render_player_card_md(
+                            text, cover_url=cover_url, buttons_enabled=bool(rows)
+                        )
+                        if rows:
+                            outcome = await self._send_official_card(
+                                event, card_md, rows, f"{label}卡片",
+                                parse_token=parse_token,
+                            )
+                        else:
+                            outcome = await self._dispatch_send(
+                                event,
+                                self._text_result(event, card_md, markdown=True),
+                                f"{label}卡片",
+                                retry_same_payload=True,
+                            )
+                        if outcome == "ok":
+                            sent_any = True
+                        else:
+                            # 播放器卡片发送失败（如图片转存失败），退回纯文本兜底
+                            fb = await self._dispatch_send(
+                                event,
+                                event.plain_result(text),
+                                f"{label}卡片（纯文本兜底）",
+                                retry_same_payload=True,
+                            )
+                            if fb == "ok":
+                                sent_any = True
+                        continue
+                    else:
+                        card_md = _markdownize_card_text(text)
+                        send_result = self._text_result(event, card_md)
                 else:
+                    if (
+                        cover_url
+                        and isinstance(comp, Image)
+                        and str(getattr(comp, "url", "") or "").strip() == cover_url
+                    ):
+                        # 封面已内嵌进卡片，不再单独发送重复图片
+                        continue
                     send_result = event.chain_result([comp])
                 outcome = await self._dispatch_send(
                     event,
@@ -2900,6 +3042,7 @@ class BKToolsPlugin(Star):
         for offset, (label, url) in enumerate(pairs[:5]):
             if len(url.encode("utf-8")) > 1024:
                 continue
+            label = _PLAYER_BUTTON_LABELS.get(label, f"🔗 {label}")[:10]
             try:
                 buttons.append(
                     Button(
@@ -4018,19 +4161,33 @@ class BKToolsPlugin(Star):
         music_caps = self._adapter_caps(event)
         if not music_caps["forward"]:
             # 不支持 Nodes（QQ 官方机器人 / 微信系）：卡片文本逐条发送。
-            # 官方机器人按 Markdown 排版，开启 official_buttons 时附加跳转按钮
-            # （音频直链/歌词链接/原始分享链接等，取决于卡片实际包含的链接行）。
+            # 官方机器人渲染播放器卡片（内嵌封面），开启 official_buttons 时
+            # 音频/歌词等长链接转为按钮行，卡片发送失败兜底纯文本。
             md_on = self._official_markdown_enabled(event)
-            card_md = _markdownize_card_text(text) if md_on else text
-            rows: List[Any] = []
-            msg_cfg_btn = _cfg(self._runtime_config(), "message", default={}) or {}
-            if bool(msg_cfg_btn.get("official_buttons", False)):
-                rows = self._official_button_rows(card_md, req_link or "")
-            if rows:
-                await self._send_official_card(event, card_md, rows, "音乐卡片")
+            if md_on:
+                msg_cfg_btn = _cfg(self._runtime_config(), "message", default={}) or {}
+                rows: List[Any] = []
+                if bool(msg_cfg_btn.get("official_buttons", False)):
+                    rows = self._official_button_rows(text, req_link or "")
+                card_md = _render_player_card_md(
+                    text, cover_url=str(cover or ""), buttons_enabled=bool(rows)
+                )
+                if rows:
+                    outcome = await self._send_official_card(
+                        event, card_md, rows, "音乐卡片"
+                    )
+                else:
+                    outcome = await self._dispatch_send(
+                        event,
+                        self._text_result(event, card_md, markdown=True),
+                        "音乐卡片",
+                        retry_same_payload=True,
+                    )
+                if outcome != "ok":
+                    await event.send(event.plain_result(text))
             else:
-                await event.send(self._text_result(event, card_md))
-            if cover:
+                await event.send(self._text_result(event, text))
+            if cover and not md_on:
                 ci = _make_image_node(str(cover))
                 if ci:
                     await event.send(event.chain_result([ci]))
