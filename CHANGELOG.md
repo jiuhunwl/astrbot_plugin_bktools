@@ -4,6 +4,22 @@
 
 格式参考 Keep a Changelog，并遵循语义化版本管理思路。
 
+## [v1.7.4] - 2026-11-02
+
+### Added
+
+- 平台适配器能力自动适配：新增 `_adapter_caps`，按 `get_platform_name()` 匹配内置能力表（`forward` 合并转发 / `file` 文件发送 / `text_chunk_chars` 文本分片长度）
+  - `qq_official`（QQ 官方机器人）：不支持合并转发与任意文件上传，长 JSON 与批量响应自动降级为普通文本分片（默认 1000 字符/片）
+  - `aiocqhttp`/NapCat/OneBot 系：合并转发 + 文件均支持（行为不变）
+  - 微信系（wechatpadpro/gewechat 等）：逐条分片（行为不变）
+  - telegram/discord/lark：支持文件、不支持合并转发；dingtalk：仅文本分片
+  - 未知平台：沿用旧版合并转发行为，保证兼容
+- 新增 `message.custom_adapter_caps` 配置（JSON 字符串）：按平台名自定义适配器能力（`forward`/`file`/`text_chunk_chars`），新适配器无需改代码即可接入；非法 JSON 忽略并告警
+
+### Changed
+
+- `_send_json_result`、`_send_batch_full_response`、`_send_packed_or_json` 的微信专属分支统一改为按适配器能力判断
+
 ## [v1.7.3] - 2026-11-02
 
 ### Fixed

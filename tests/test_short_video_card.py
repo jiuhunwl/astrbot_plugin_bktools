@@ -571,5 +571,108 @@ def _async(value):
     return _coro()
 
 
+class _EventOnPlatform(_Event):
+    """模拟 get_platform_name 返回不同平台的 Event。"""
+
+    def __init__(self, platform):
+        super().__init__()
+        self._platform = platform
+
+    def get_platform_name(self):
+        return self._platform
+
+
+class AdapterCapsTests(unittest.IsolatedAsyncioTestCase):
+    """平台适配器能力：官方机器人/微信自动降级 + 自定义适配器覆盖。"""
+
+    def _plugin(self, message_cfg=None, batch_cfg=None):
+        cfg = {"opening_enable": False, "short_video_text_metadata": True}
+        cfg.update(message_cfg or {})
+        top = {
+            "message": cfg,
+            "video_threshold": {"threshold_enabled": False},
+        }
+        if batch_cfg is not None:
+            top["batch_output"] = batch_cfg
+        return bk.BKToolsPlugin(object(), top)
+
+    def test_builtin_caps_matching(self):
+        plugin = self._plugin()
+        self.assertTrue(plugin._adapter_caps(_EventOnPlatform("aiocqhttp"))["forward"])
+        self.assertTrue(plugin._adapter_caps(_EventOnPlatform("aiocqhttp"))["file"])
+        # QQ 官方机器人：不支持合并转发与文件
+        caps = plugin._adapter_caps(_EventOnPlatform("qq_official"))
+        self.assertFalse(caps["forward"])
+        self.assertFalse(caps["file"])
+        self.assertEqual(caps["text_chunk_chars"], 1000)
+        # NapCat 自定义平台名（特征 token 匹配）
+        self.assertTrue(plugin._adapter_caps(_EventOnPlatform("napcat_custom"))["forward"])
+        # 微信系
+        self.assertFalse(plugin._adapter_caps(_EventOnPlatform("wechatpadpro"))["forward"])
+        # 未知平台：沿用旧行为（合并转发）
+        caps = plugin._adapter_caps(_EventOnPlatform("some_new_adapter"))
+        self.assertTrue(caps["forward"])
+        self.assertTrue(caps["file"])
+
+    def test_custom_caps_override(self):
+        plugin = self._plugin({
+            "custom_adapter_caps": json.dumps(
+                {"mybot": {"forward": False, "file": True, "text_chunk_chars": 800}}
+            )
+        })
+        caps = plugin._adapter_caps(_EventOnPlatform("MyBot"))
+        self.assertFalse(caps["forward"])
+        self.assertTrue(caps["file"])
+        self.assertEqual(caps["text_chunk_chars"], 800)
+
+    def test_custom_caps_invalid_json_ignored(self):
+        plugin = self._plugin({"custom_adapter_caps": "{not json"})
+        # 非法 JSON 不抛错，aiocqhttp 用内置能力
+        self.assertTrue(plugin._adapter_caps(_EventOnPlatform("aiocqhttp"))["forward"])
+
+    async def test_json_result_on_official_bot_sends_plain_chunks(self):
+        """QQ 官方机器人：长 JSON 不走合并转发，按 1000 字符分片发普通文本。"""
+        plugin = self._plugin()
+        big = {"code": 200, "data": {"pad": "x" * 5000}}
+        event = _EventOnPlatform("qq_official")
+        ok = await plugin._send_json_result(event, big, ("t", 0), "测试")
+        self.assertTrue(ok)
+        kinds = [k for k, _ in event.sent]
+        self.assertTrue(kinds and all(k == "plain" for k in kinds))
+        self.assertGreater(len(kinds), 1)  # 5000+ 字符被按 1000 字符分片
+        joined = "".join(str(t) for _, t in event.sent)
+        self.assertIn('"code":200', joined)
+
+    async def test_batch_file_mode_skipped_on_official_bot(self):
+        """批量超阈值 + file 模式：官方机器人不支持文件 → 自动降级为分片文本。"""
+        data = sample_data(images=[f"https://x.com/{i}.jpg" for i in range(5)])
+        plugin = self._plugin(
+            batch_cfg={"direct_json_enabled": True, "image_count_threshold": 3,
+                       "live_photo_count_threshold": 10}
+        )
+        j = {"code": 200, "msg": "解析成功", "data": data}
+        plugin._fetch_short_video = lambda link: _async((j, data))
+        event = _EventOnPlatform("qq_official")
+        await plugin._reply_short_video(event, "https://v.douyin.com/abc/")
+        kinds = [k for k, _ in event.sent]
+        self.assertTrue(kinds)
+        self.assertNotIn("chain", kinds)  # 没有任何合并转发
+        self.assertTrue(all(k == "plain" for k in kinds))
+
+    async def test_batch_file_mode_still_used_on_napcat(self):
+        """回归：NapCat（aiocqhttp）平台批量输出仍走文件模式。"""
+        data = sample_data(images=[f"https://x.com/{i}.jpg" for i in range(5)])
+        plugin = self._plugin(
+            batch_cfg={"direct_json_enabled": True, "image_count_threshold": 3,
+                       "live_photo_count_threshold": 10}
+        )
+        j = {"code": 200, "msg": "解析成功", "data": data}
+        plugin._fetch_short_video = lambda link: _async((j, data))
+        event = _EventOnPlatform("aiocqhttp")
+        await plugin._reply_short_video(event, "https://v.douyin.com/abc/")
+        kinds = [k for k, _ in event.sent]
+        self.assertEqual(kinds, ["plain", "chain"])  # 摘要 + JSON 文件
+
+
 if __name__ == "__main__":
     unittest.main()

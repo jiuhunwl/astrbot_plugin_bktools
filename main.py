@@ -189,7 +189,7 @@ except ImportError:
     )
 
 
-PLUGIN_VERSION = "1.7.3"
+PLUGIN_VERSION = "1.7.4"
 
 
 def _cfg(root: Any, *keys: str, default: Any = None) -> Any:
@@ -249,6 +249,36 @@ _SIZE_UNITS = ("B", "KB", "MB", "GB", "TB", "PB")
 _RESOURCE_TYPE_LABELS = {"video": "视频", "image": "图集", "live": "实况"}
 # 统一契约里可能承载标签的字段路径（按优先级）
 _TAG_PATHS = ("extra.tags", "tags", "extra.tag_list", "tag_list", "extra.topics")
+
+# 各平台适配器对消息组件的内置支持能力。
+# forward: Nodes 合并转发；file: File 组件发送；text_chunk_chars: 普通文本分片长度。
+# QQ 官方机器人（qq_official）只支持文本/富媒体且被动回复有长度限制，
+# 不支持合并转发与任意文件上传；微信系平台不支持合并转发与文件发送。
+_ADAPTER_CAPS_DEFAULT: Dict[str, Dict[str, Any]] = {
+    "aiocqhttp": {"forward": True, "file": True, "text_chunk_chars": 3500},
+    "qq_official": {"forward": False, "file": False, "text_chunk_chars": 1000},
+    "wechat": {"forward": False, "file": False, "text_chunk_chars": 1500},
+    "telegram": {"forward": False, "file": True, "text_chunk_chars": 3500},
+    "discord": {"forward": False, "file": True, "text_chunk_chars": 1800},
+    "lark": {"forward": False, "file": True, "text_chunk_chars": 3000},
+    "dingtalk": {"forward": False, "file": False, "text_chunk_chars": 1500},
+}
+
+# 平台名特征 token → 内置能力表键（按序匹配，具体 token 在前）
+_ADAPTER_CAPS_MATCHERS: Tuple[Tuple[str, str], ...] = (
+    ("aiocqhttp", "aiocqhttp"),
+    ("onebot", "aiocqhttp"),
+    ("napcat", "aiocqhttp"),
+    ("lagrange", "aiocqhttp"),
+    ("shamrock", "aiocqhttp"),
+    ("qq_official", "qq_official"),
+    ("qqofficial", "qq_official"),
+    ("qqbot", "qq_official"),
+    ("wechat", "wechat"),
+    ("weixin", "wechat"),
+    ("gewechat", "wechat"),
+    ("padpro", "wechat"),
+)
 
 # ── 音乐卡片字段规范化 ────────────────────────────────────────────────────
 # 音乐平台内部标识 → 展示名（未知标识保留原值，避免出现 "平台：qishui" 这类内部代号）
@@ -2094,16 +2124,17 @@ class BKToolsPlugin(Star):
         )
         json_limit = max(text_limit, int(configured_json_limit or 0))
         try:
-            if self._is_wechat_platform(event):
-                # 微信协议端不支持 Nodes 合并转发（渲染为「聊天记录」卡片且内容
-                # 被拼接成「昵称: 内容」），统一改为分条普通文本发送。
+            caps = self._adapter_caps(event)
+            if not caps["forward"]:
+                # 平台不支持 Nodes 合并转发（微信系 / QQ 官方机器人等），
+                # 统一改为分条普通文本发送，分片长度按适配器能力取值。
                 if len(encoded) > json_limit:
                     raise ValueError("解析 JSON 超过配置的输出大小限制")
                 pieces: List[str] = [header] if header else []
                 if len(json_text) <= text_limit:
                     pieces.append(json_text)
                 else:
-                    chunk_size = max(256, min(text_limit, 1500))
+                    chunk_size = max(256, min(text_limit, caps["text_chunk_chars"]))
                     pieces.extend(
                         json_text[index : index + chunk_size]
                         for index in range(0, len(json_text), chunk_size)
@@ -2284,10 +2315,16 @@ class BKToolsPlugin(Star):
             if stripped and stripped not in header:
                 header = f"{header.rstrip()}\n原始链接：{stripped}"
         mode = str(msg_cfg.get("batch_full_response_mode", "file") or "file").strip().lower()
-        if mode == "file" and not self._is_wechat_platform(event):
+        caps = self._adapter_caps(event)
+        if mode == "file" and caps["file"]:
             if await self._send_batch_as_file(event, payload, header, parse_token, reason):
                 return True
             logger.info("%s，JSON 文件方式未成功，降级为打包消息", reason)
+        elif mode == "file":
+            logger.info(
+                "平台 %s 不支持文件发送（batch_full_response_mode=file），按适配器能力改走打包/分片消息",
+                caps["name"],
+            )
         return await self._send_json_result(
             event, payload, parse_token, reason, header_text=header or None
         )
@@ -2344,11 +2381,13 @@ class BKToolsPlugin(Star):
                 event, raw_json, parse_token, f"{label}无法构造合并转发"
             )
 
-        if self._is_wechat_platform(event):
-            # 微信协议端不支持 Nodes 合并转发（会渲染为 com.tencent.multimsg
-            # 「聊天记录」卡片，节点昵称不生效、内容被拼接为「昵称: 内容」、
-            # 单条限制严格），降级为逐条普通消息发送。
-            logger.info("%s检测到微信平台，降级为逐条普通消息发送", label)
+        caps = self._adapter_caps(event)
+        if not caps["forward"]:
+            # 平台不支持 Nodes 合并转发（微信系 / QQ 官方机器人等，会渲染异常
+            # 或直接被拒绝），降级为逐条普通消息/组件发送。
+            logger.info(
+                "%s平台 %s 不支持合并转发，降级为逐条发送", label, caps["name"]
+            )
             return await self._send_forward_as_plain(
                 event, forward_nodes, parse_token, label
             )
@@ -2512,6 +2551,78 @@ class BKToolsPlugin(Star):
         if name in ("wechatpadpro", "gewechat", "webchat", "wechat", "weixin", "wx"):
             return True
         return any(token in name for token in ("wechat", "weixin", "gewechat", "padpro"))
+
+    @staticmethod
+    def _builtin_adapter_caps(name: str) -> Optional[Dict[str, Any]]:
+        """按平台名（小写）匹配内置适配器能力表；返回 None 表示未知平台。"""
+        if not name:
+            return None
+        if name in _ADAPTER_CAPS_DEFAULT:
+            return _ADAPTER_CAPS_DEFAULT[name]
+        for token, key in _ADAPTER_CAPS_MATCHERS:
+            if token in name:
+                return _ADAPTER_CAPS_DEFAULT[key]
+        return None
+
+    def _adapter_caps(self, event: AstrMessageEvent) -> Dict[str, Any]:
+        """查询当前事件所属平台适配器的消息发送能力。
+
+        返回字段：
+        - forward: 是否支持 Nodes 合并转发（不支持则降级为普通文本分片）
+        - file: 是否支持 File 组件发送文件
+        - text_chunk_chars: 普通文本分片的建议长度
+        - name: 平台名（小写，用于日志）
+
+        匹配顺序：用户自定义（message.custom_adapter_caps，精确匹配平台名，大小写
+        不敏感）> 内置适配表（精确名 > 特征 token）> 未知平台默认沿用合并转发旧行为。
+        """
+        try:
+            name = str(event.get_platform_name() or "").strip().lower()
+        except Exception:
+            name = ""
+        builtin = self._builtin_adapter_caps(name)
+        if builtin is not None:
+            caps = dict(builtin)
+        else:
+            # 未知平台：保持与旧版一致的合并转发行为，出问题可由用户自定义覆盖
+            caps = {"forward": True, "file": True, "text_chunk_chars": 3500}
+        caps["name"] = name or "unknown"
+
+        raw = ""
+        try:
+            raw = str(
+                (_cfg(self._runtime_config(), "message", default={}) or {}).get(
+                    "custom_adapter_caps"
+                )
+                or ""
+            ).strip()
+        except Exception:
+            raw = ""
+        if raw:
+            try:
+                custom = json.loads(raw)
+            except Exception as ex:
+                logger.warning("message.custom_adapter_caps 不是合法 JSON，已忽略: %s", ex)
+                custom = None
+            if isinstance(custom, dict):
+                over = custom.get(name)
+                if isinstance(over, dict):
+                    for key in ("forward", "file"):
+                        if key in over:
+                            caps[key] = bool(over[key])
+                    tc = over.get("text_chunk_chars")
+                    if tc is not None:
+                        caps["text_chunk_chars"] = _to_int(
+                            tc, caps["text_chunk_chars"]
+                        )
+                    logger.info(
+                        "平台 %s 使用自定义适配器能力: forward=%s, file=%s, text_chunk_chars=%s",
+                        caps["name"], caps["forward"], caps["file"], caps["text_chunk_chars"],
+                    )
+        caps["text_chunk_chars"] = max(
+            200, min(_to_int(caps.get("text_chunk_chars"), 3500), 20000)
+        )
+        return caps
 
     def _bot_identity(self, event: AstrMessageEvent) -> Tuple[str, Any]:
         name = "BKtools"

@@ -468,6 +468,15 @@
         "default": "file",
         "hint": "file：先发可读摘要卡片，再把完整响应保存为 JSON 文件发送（默认；NapCat 对过大的合并转发常报 retcode 1200，文件方式稳定得多）。forward：沿用打包合并转发消息。file 模式下若 AstrBot 与 NapCat 分离部署（不同容器/机器），需在 AstrBot 配置 callback_api_base，否则 NapCat 读不到本地文件，会自动降级为打包消息。"
       },
+      "custom_adapter_caps": {
+        "description": "自定义平台适配器能力（JSON）",
+        "type": "string",
+        "default": "",
+        "condition": {
+          "advanced_settings": true
+        },
+        "hint": "JSON 对象，键为平台适配器名（get_platform_name() 的返回值，大小写不敏感），值支持 forward（是否支持合并转发）、file（是否支持文件发送）、text_chunk_chars（普通文本分片长度）。示例：{\"my_adapter\":{\"forward\":false,\"file\":true,\"text_chunk_chars\":1200}}。留空使用内置适配表（已覆盖 aiocqhttp/NapCat、QQ 官方机器人 qq_official、微信系、telegram、discord、lark、dingtalk；未知平台默认支持合并转发与文件）。"
+      },
       "max_images_per_work": {
         "description": "每个作品最多展示图片数",
         "type": "int",
