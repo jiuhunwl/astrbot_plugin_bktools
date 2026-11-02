@@ -452,16 +452,12 @@ class MusicCardTests(unittest.TestCase):
         self.assertNotIn("未知艺术家", card)
         self.assertNotIn("艺人：", card)
 
-    def test_audio_url_shortened_by_default(self):
+    def test_audio_url_always_full_link(self):
+        """直链必须完整展示——截断过的链接复制出去没法用。"""
         card = bk._format_music_card("qishui", self._fields(self.QISHUI))
         audio_line = [ln for ln in card.splitlines() if ln.startswith("音频：")][0]
-        self.assertTrue(audio_line.endswith("…"))
-        self.assertLess(len(audio_line), 140)
-
-    def test_audio_url_kept_when_shortening_disabled(self):
-        card = bk._format_music_card("qishui", self._fields(self.QISHUI), display_limit=0)
-        audio_line = [ln for ln in card.splitlines() if ln.startswith("音频：")][0]
         self.assertEqual(audio_line, "音频：" + self.QISHUI["url"])
+        self.assertNotIn("…", audio_line)
 
     def test_missing_title_renders_dash(self):
         card = bk._format_music_card("qishui", self._fields({"url": "https://x/a.mp3"}))

@@ -189,7 +189,7 @@ except ImportError:
     )
 
 
-PLUGIN_VERSION = "1.7.1"
+PLUGIN_VERSION = "1.7.2"
 
 
 def _cfg(root: Any, *keys: str, default: Any = None) -> Any:
@@ -360,16 +360,6 @@ def _clean_lyric_preview(lyric: Any, *, max_lines: int = 6, max_chars: int = 300
     return preview + "…" if truncated else preview
 
 
-def _shorten_for_display(text: Any, limit: int = 96) -> str:
-    """长直链的展示截断（仅影响卡片文本，完整地址仍用于实际播放/下载请求）。"""
-    if limit <= 0:
-        return str(text or "").strip()
-    s = str(text or "").strip()
-    if len(s) <= limit:
-        return s
-    return s[: max(1, limit - 1)] + "…"
-
-
 def _extract_music_fields(
     data: Any,
     json_root: Any,
@@ -418,8 +408,11 @@ def _extract_music_fields(
     }
 
 
-def _format_music_card(plat: str, fields: Mapping[str, str], *, display_limit: int = 96) -> str:
-    """渲染音乐解析卡片：平台名中文化，空字段按契约省略对应行。"""
+def _format_music_card(plat: str, fields: Mapping[str, str]) -> str:
+    """渲染音乐解析卡片：平台名中文化，空字段按契约省略对应行。
+
+    音频/歌词直链始终完整展示（截断后的链接无法复制使用）。
+    """
     lines = [f"平台：{_MUSIC_PLATFORM_LABELS.get(plat, plat)}"]
     lines.append(f"曲名：{fields['title']}" if fields.get("title") else "曲名：—")
     if fields.get("author"):
@@ -431,11 +424,11 @@ def _format_music_card(plat: str, fields: Mapping[str, str], *, display_limit: i
     quality_bits = [fields[k] for k in ("format", "level", "bitrate") if fields.get(k)]
     if quality_bits:
         lines.append("音质：" + " · ".join(quality_bits))
-    lines.append(f"音频：{_shorten_for_display(fields.get('audio'), display_limit)}")
+    lines.append(f"音频：{str(fields.get('audio') or '').strip()}")
     lyric = str(fields.get("lyric") or "")
     if lyric:
         if _is_http_url(lyric):
-            lines.append(f"歌词链接：{_shorten_for_display(lyric, display_limit)}")
+            lines.append(f"歌词链接：{lyric.strip()}")
         else:
             preview = _clean_lyric_preview(lyric)
             if preview:
@@ -3460,9 +3453,7 @@ class BKToolsPlugin(Star):
             )
             return
 
-        # 长直链默认截断展示（仅影响卡片文本，实际播放/下载仍用完整地址）
-        display_limit = 96 if msg_cfg.get("shorten_music_link", True) else 0
-        text = _format_music_card(plat, mf, display_limit=display_limit)
+        text = _format_music_card(plat, mf)
         
         # 尝试发送语音消息
         voice_sent = False
