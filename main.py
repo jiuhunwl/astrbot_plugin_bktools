@@ -201,7 +201,7 @@ except ImportError:
     )
 
 
-PLUGIN_VERSION = "1.7.9"
+PLUGIN_VERSION = "1.7.10"
 
 
 def _cfg(root: Any, *keys: str, default: Any = None) -> Any:
@@ -1824,6 +1824,11 @@ class BKToolsPlugin(Star):
         self._campaign_lock = asyncio.Lock()
         # 当次领取内有效的聊天联系方式（只用于问卷请求体，不落日志/状态文件）
         self._claim_contact: Dict[str, Dict[str, str]] = {}
+        logger.info(
+            "BKtools v%s 已加载，运行文件：%s",
+            PLUGIN_VERSION,
+            os.path.abspath(__file__),
+        )
 
     def _runtime_config(self) -> Dict[str, Any]:
         return self._runtime_config_var.get() or self.config
@@ -4303,6 +4308,7 @@ class BKToolsPlugin(Star):
         await event.send(
             event.plain_result(
                 f"BKtools v{PLUGIN_VERSION}\n"
+                f"运行文件：{os.path.abspath(__file__)}\n"
                 f"更新仓库：https://github.com/{REPOSITORY}\n"
                 "管理员可使用 /bk检查更新 和 /bk更新插件。"
             )
@@ -4421,6 +4427,8 @@ class BKToolsPlugin(Star):
         """检查依赖、接口配置与关键安全控制。"""
         cfg = self._runtime_config()
         checks: List[str] = []
+        checks.append(f"ℹ️ 插件版本：v{PLUGIN_VERSION}")
+        checks.append(f"ℹ️ 运行文件：{os.path.abspath(__file__)}")
         for label, path in (
             ("短视频接口", ("short_video", "endpoint")),
             ("网易云搜索", ("netease", "search_endpoint")),

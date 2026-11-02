@@ -1,6 +1,6 @@
 # astrbot_plugin_bktools（BKtools）
 
-当前版本：`v1.7.9`，要求 AstrBot `v4.10.4+`，已验证兼容 AstrBot `v4.25.5`。
+当前版本：`v1.7.10`，要求 AstrBot `v4.10.4+`，已验证兼容 AstrBot `v4.25.5`。
 
 ## v1.7.8 官方机器人播放器卡片
 
