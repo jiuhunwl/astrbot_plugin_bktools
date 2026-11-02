@@ -475,7 +475,19 @@
         "condition": {
           "advanced_settings": true
         },
-        "hint": "JSON 对象，键为平台适配器名（get_platform_name() 的返回值，大小写不敏感），值支持 forward（是否支持合并转发）、file（是否支持文件发送）、text_chunk_chars（普通文本分片长度）。示例：{\"my_adapter\":{\"forward\":false,\"file\":true,\"text_chunk_chars\":1200}}。留空使用内置适配表（已覆盖 aiocqhttp/NapCat、QQ 官方机器人 qq_official、微信系、telegram、discord、lark、dingtalk；未知平台默认支持合并转发与文件）。"
+        "hint": "JSON 对象，键为平台适配器名（get_platform_name() 的返回值，大小写不敏感），值支持 forward（是否支持合并转发）、file（是否支持文件发送）、markdown（是否支持 Markdown 富文本消息）、text_chunk_chars（普通文本分片长度）。示例：{\"my_adapter\":{\"forward\":false,\"file\":true,\"markdown\":true,\"text_chunk_chars\":1200}}。留空使用内置适配表（已覆盖 aiocqhttp/NapCat、QQ 官方机器人 qq_official、微信系、telegram、discord、lark、dingtalk；未知平台默认支持合并转发与文件）。"
+      },
+      "official_markdown": {
+        "description": "官方机器人 Markdown 排版",
+        "type": "bool",
+        "default": true,
+        "hint": "QQ 官方机器人（qq_official）发送摘要卡片时按 Markdown 排版（加粗字段标签），观感更好。机器人未获得原生 Markdown 权限时 AstrBot 会自动回退纯文本，开启无副作用；关闭后一律发纯文本。仅对 Markdown 能力平台生效，其他平台不受影响。"
+      },
+      "official_buttons": {
+        "description": "官方机器人摘要按钮",
+        "type": "bool",
+        "default": false,
+        "hint": "批量输出摘要卡片附带「原始链接」跳转按钮（inline keyboard）。需要官方机器人在 QQ 开放平台申请 keyboard 按钮权限，未授权时发送会失败并自动降级为无按钮摘要；需 AstrBot 较新版本（含按钮组件）。默认关闭。"
       },
       "max_images_per_work": {
         "description": "每个作品最多展示图片数",

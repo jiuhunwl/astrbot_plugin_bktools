@@ -4,6 +4,21 @@
 
 格式参考 Keep a Changelog，并遵循语义化版本管理思路。
 
+## [v1.7.5] - 2026-11-02
+
+### Added
+
+- QQ 官方机器人 Markdown 输出优化（基于 AstrBot qqofficial 适配器的 `use_markdown_` 能力）：
+  - 摘要卡片在官方机器人上按 Markdown 排版发送（字段标签加粗，如 `**标题**：xxx`），观感更好；机器人未获得原生 Markdown 权限时 AstrBot 适配器自动回退纯文本，开启无副作用
+  - JSON 原文分片强制纯文本发送（`use_markdown=False`），避免 JSON 被 Markdown 渲染破坏
+  - 新增 `message.official_markdown` 配置（默认开启），关闭后官方机器人一律发纯文本
+- 新增 `message.official_buttons` 配置（默认关闭）：批量输出摘要卡片附带「原始链接」跳转按钮（inline keyboard，基于 ActionRow/Button 可移植组件）。需要官方平台 keyboard 权限，未授权发送失败时自动降级为无按钮摘要重发；AstrBot 版本过旧无按钮组件时自动停用
+- 适配器能力表新增 `markdown` 能力位（`qq_official=True`，其余平台 `False`），`message.custom_adapter_caps` 支持按平台自定义 `markdown` 覆盖
+
+### Changed
+
+- 不支持合并转发的平台降级路径（`_send_forward_as_plain`）：Plain 文本卡片改走普通文本消息并按平台能力附加 Markdown 排版标记；微信平台能力不变、文本内容与旧版一致
+
 ## [v1.7.4] - 2026-11-02
 
 ### Added

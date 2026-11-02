@@ -22,6 +22,8 @@ class _Component:
         self.args = args
         self.kwargs = kwargs
         self.content = kwargs.get("content", [])
+        # 真实 Plain/组件有 text 属性（_send_forward_as_plain 依赖它读取文本）
+        self.text = kwargs.get("text", args[0] if args else "")
 
     @classmethod
     def fromURL(cls, url):
@@ -568,10 +570,14 @@ class WechatPlatformTests(unittest.IsolatedAsyncioTestCase):
             event, forward_nodes, {"code": 200}, ("global", 0), "短视频解析结果"
         )
         self.assertTrue(sent)
-        # 3 个组件逐条发送，全部是单组件普通消息，无 Nodes 合并转发
+        # 3 个组件逐条发送。Plain 文本走普通消息（v1.7.5 起 _send_forward_as_plain
+        # 对 Plain 用 plain_result，Markdown 能力平台才会附加排版标记），
+        # 微信 platform markdown=False，文本内容与旧版完全一致。
         self.assertEqual(len(event.sent), 3)
-        self.assertTrue(all(r[0] == "chain" for r in event.sent))
-        self.assertTrue(all(not isinstance(r[1], (list,)) or len(r[1]) == 1 for r in event.sent))
+        self.assertEqual([r[0] for r in event.sent], ["plain", "plain", "plain"])
+        self.assertEqual(
+            [r[1] for r in event.sent], ["标题", "视频：https://x", "第二条"]
+        )
 
     async def test_packed_non_wechat_keeps_forward(self):
         """非微信平台保持合并转发不变。"""

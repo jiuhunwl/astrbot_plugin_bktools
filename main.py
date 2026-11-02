@@ -30,6 +30,18 @@ import aiohttp
 from astrbot.api import logger
 from astrbot.api.event import filter, AstrMessageEvent
 from astrbot.api.message_components import File, Image, Node, Nodes, Plain, Record, Video
+
+# 按钮组件（ActionRow/Button）为较新版本 AstrBot 才有的可移植组件，
+# QQ 官方机器人适配器会把它转成 inline keyboard。老版本缺失时 fail-soft，
+# 只停用按钮功能，不影响其余消息输出。
+try:
+    from astrbot.api.message_components import ActionRow, Button
+
+    _BUTTONS_READY = True
+except Exception:  # pragma: no cover - 旧版 AstrBot 无按钮组件
+    ActionRow = None  # type: ignore[assignment]
+    Button = None  # type: ignore[assignment]
+    _BUTTONS_READY = False
 from astrbot.api.star import Context, Star, register
 from astrbot.core.star.filter.event_message_type import EventMessageType
 
@@ -189,7 +201,7 @@ except ImportError:
     )
 
 
-PLUGIN_VERSION = "1.7.4"
+PLUGIN_VERSION = "1.7.5"
 
 
 def _cfg(root: Any, *keys: str, default: Any = None) -> Any:
@@ -251,17 +263,20 @@ _RESOURCE_TYPE_LABELS = {"video": "视频", "image": "图集", "live": "实况"}
 _TAG_PATHS = ("extra.tags", "tags", "extra.tag_list", "tag_list", "extra.topics")
 
 # 各平台适配器对消息组件的内置支持能力。
-# forward: Nodes 合并转发；file: File 组件发送；text_chunk_chars: 普通文本分片长度。
+# forward: Nodes 合并转发；file: File 组件发送；markdown: Markdown 富文本消息；
+# text_chunk_chars: 普通文本分片长度。
 # QQ 官方机器人（qq_official）只支持文本/富媒体且被动回复有长度限制，
-# 不支持合并转发与任意文件上传；微信系平台不支持合并转发与文件发送。
+# 不支持合并转发与任意文件上传；但支持原生 Markdown 消息（AstrBot 适配器
+# use_markdown_ 标记，未获权限时适配器自动回退纯文本）与 inline keyboard 按钮。
+# 微信系平台不支持合并转发与文件发送。
 _ADAPTER_CAPS_DEFAULT: Dict[str, Dict[str, Any]] = {
-    "aiocqhttp": {"forward": True, "file": True, "text_chunk_chars": 3500},
-    "qq_official": {"forward": False, "file": False, "text_chunk_chars": 1000},
-    "wechat": {"forward": False, "file": False, "text_chunk_chars": 1500},
-    "telegram": {"forward": False, "file": True, "text_chunk_chars": 3500},
-    "discord": {"forward": False, "file": True, "text_chunk_chars": 1800},
-    "lark": {"forward": False, "file": True, "text_chunk_chars": 3000},
-    "dingtalk": {"forward": False, "file": False, "text_chunk_chars": 1500},
+    "aiocqhttp": {"forward": True, "file": True, "markdown": False, "text_chunk_chars": 3500},
+    "qq_official": {"forward": False, "file": False, "markdown": True, "text_chunk_chars": 1000},
+    "wechat": {"forward": False, "file": False, "markdown": False, "text_chunk_chars": 1500},
+    "telegram": {"forward": False, "file": True, "markdown": False, "text_chunk_chars": 3500},
+    "discord": {"forward": False, "file": True, "markdown": False, "text_chunk_chars": 1800},
+    "lark": {"forward": False, "file": True, "markdown": False, "text_chunk_chars": 3000},
+    "dingtalk": {"forward": False, "file": False, "markdown": False, "text_chunk_chars": 1500},
 }
 
 # 平台名特征 token → 内置能力表键（按序匹配，具体 token 在前）
@@ -303,6 +318,28 @@ _MUSIC_QUALITY_LABELS = {
     "higher": "较高", "highest": "极高", "exhigh": "极高", "lossless": "无损",
     "hires": "Hi-Res", "sq": "无损", "hq": "高",
 }
+
+# 「字段标签：值」形态的卡片文本行（QQ 官方机器人 Markdown 排版用）。
+# 标签为 2~10 个非空白、非冒号字符；JSON 行、无冒号行不匹配。
+_MD_FIELD_LINE_RE = re.compile(r"^([^\s：:]{2,10})(?:：|:)\s*(\S.*)$")
+
+
+def _markdownize_card_text(text: str) -> str:
+    """把纯文本摘要卡片转换为 Markdown 排版（仅加粗字段标签）。
+
+    只处理「标签：值」形态的行；URL 行的标签同样加粗（值保持原样，链接仍可
+    复制）。JSON 原文行（以 { [ " 开头）原样保留，避免破坏结构。
+    非官方机器人平台不应调用本函数——加粗星号会被当普通字符显示。
+    """
+    out: List[str] = []
+    for line in str(text).splitlines():
+        stripped = line.lstrip()
+        m = _MD_FIELD_LINE_RE.match(line)
+        if m and "://" not in m.group(1) and stripped[:1] not in ('{', '[', '"'):
+            out.append(f"**{m.group(1)}**：{m.group(2)}")
+        else:
+            out.append(line)
+    return "\n".join(out)
 
 
 def _clean_meta(value: Any) -> str:
@@ -2096,6 +2133,7 @@ class BKToolsPlugin(Star):
         parse_token: Tuple[str, int],
         reason: str,
         header_text: Optional[str] = None,
+        link_url: Optional[str] = None,
     ) -> bool:
         """把接口响应作为消息发送。
 
@@ -2128,9 +2166,15 @@ class BKToolsPlugin(Star):
             if not caps["forward"]:
                 # 平台不支持 Nodes 合并转发（微信系 / QQ 官方机器人等），
                 # 统一改为分条普通文本发送，分片长度按适配器能力取值。
+                # 官方机器人启用 Markdown 时：摘要卡片按 Markdown 排版发送
+                # （加粗字段标签），JSON 原文分片强制纯文本避免被渲染破坏。
                 if len(encoded) > json_limit:
                     raise ValueError("解析 JSON 超过配置的输出大小限制")
-                pieces: List[str] = [header] if header else []
+                md_on = self._official_markdown_enabled(event)
+                header_md = _markdownize_card_text(header) if header and md_on else ""
+                pieces: List[str] = [header_md] if header_md else (
+                    [header] if header else []
+                )
                 if len(json_text) <= text_limit:
                     pieces.append(json_text)
                 else:
@@ -2139,21 +2183,57 @@ class BKToolsPlugin(Star):
                         json_text[index : index + chunk_size]
                         for index in range(0, len(json_text), chunk_size)
                     )
+                button_row = None
+                if header_md and link_url:
+                    msg_cfg = _cfg(self._runtime_config(), "message", default={}) or {}
+                    if bool(msg_cfg.get("official_buttons", False)):
+                        button_row = self._official_button_row(link_url)
                 sent_any = False
-                for piece in pieces:
+                for index, piece in enumerate(pieces):
                     if self._is_parse_cancelled(parse_token):
-                        logger.info("%s微信分片发送过程中收到停止指令", reason)
+                        logger.info("%s分片发送过程中收到停止指令", reason)
                         break
-                    outcome = await self._dispatch_send(
-                        event,
-                        event.plain_result(piece),
-                        f"{reason}（普通消息分片）",
-                        retry_same_payload=True,
-                    )
+                    is_header = bool(header_md) and index == 0
+                    if is_header and button_row is not None:
+                        # 摘要卡片 + 「原始链接」按钮（需官方平台 keyboard 权限，
+                        # 未授权时发送会失败，降级为无按钮摘要重发一次）
+                        btn_res = event.chain_result([Plain(piece), button_row])
+                        try:
+                            btn_res.use_markdown(True)
+                        except Exception:
+                            pass
+                        outcome = await self._dispatch_send(
+                            event,
+                            btn_res,
+                            f"{reason}（摘要卡片+按钮）",
+                            retry_same_payload=True,
+                        )
+                        if outcome != "ok" and not self._is_parse_cancelled(parse_token):
+                            logger.info("%s，按钮消息发送失败，降级为无按钮摘要", reason)
+                            outcome = await self._dispatch_send(
+                                event,
+                                self._text_result(event, piece, markdown=True),
+                                f"{reason}（摘要卡片）",
+                                retry_same_payload=True,
+                            )
+                    elif is_header:
+                        outcome = await self._dispatch_send(
+                            event,
+                            self._text_result(event, piece, markdown=True),
+                            f"{reason}（摘要卡片）",
+                            retry_same_payload=True,
+                        )
+                    else:
+                        outcome = await self._dispatch_send(
+                            event,
+                            self._text_result(event, piece, markdown=False),
+                            f"{reason}（普通消息分片）",
+                            retry_same_payload=True,
+                        )
                     if outcome == "ok":
                         sent_any = True
                 if not sent_any:
-                    logger.warning("%s，微信平台分片均未发送成功", reason)
+                    logger.warning("%s，平台分片均未发送成功（%s）", reason, caps["name"])
                 return sent_any
             if len(json_text) <= text_limit and not header:
                 result = event.plain_result(json_text)
@@ -2326,7 +2406,8 @@ class BKToolsPlugin(Star):
                 caps["name"],
             )
         return await self._send_json_result(
-            event, payload, parse_token, reason, header_text=header or None
+            event, payload, parse_token, reason,
+            header_text=header or None, link_url=link,
         )
 
     async def _send_forward_as_plain(
@@ -2336,25 +2417,37 @@ class BKToolsPlugin(Star):
         parse_token: Tuple[str, int],
         label: str,
     ) -> bool:
-        """微信平台降级：把合并转发节点逐条作为普通消息发送。
+        """不支持合并转发的平台降级：把合并转发节点逐条作为普通消息发送。
 
-        每个 Node 的 content 为组件列表（Plain/Image/Video 等），逐个组件独立
-        发送；任一发送失败不阻断后续节点（尽力而为），期间可响应停止指令。
+        微信系 / QQ 官方机器人等平台不支持 Nodes，每个 Node 的 content 为
+        组件列表（Plain/Image/Video 等），逐个组件独立发送；任一发送失败不
+        阻断后续节点（尽力而为），期间可响应停止指令。
         """
         sent_any = False
         for node in forward_nodes:
             if self._is_parse_cancelled(parse_token):
-                logger.info("%s微信降级发送过程中收到停止指令", label)
+                logger.info("%s降级发送过程中收到停止指令", label)
                 return sent_any
             content = getattr(node, "content", None)
             components = content if isinstance(content, list) else [node]
             for comp in components:
                 if self._is_parse_cancelled(parse_token):
-                    logger.info("%s微信降级发送过程中收到停止指令", label)
+                    logger.info("%s降级发送过程中收到停止指令", label)
                     return sent_any
+                if isinstance(comp, Plain):
+                    # 文本卡片：官方机器人启用 Markdown 时加粗字段标签后发送；
+                    # 其余平台保持与旧版一致的纯文本行为
+                    text = str(getattr(comp, "text", "") or "")
+                    md_on = self._official_markdown_enabled(event)
+                    send_result = self._text_result(
+                        event,
+                        _markdownize_card_text(text) if md_on else text,
+                    )
+                else:
+                    send_result = event.chain_result([comp])
                 outcome = await self._dispatch_send(
                     event,
-                    event.chain_result([comp]),
+                    send_result,
                     f"{label}节点",
                     retry_same_payload=True,
                 )
@@ -2565,11 +2658,12 @@ class BKToolsPlugin(Star):
         return None
 
     def _adapter_caps(self, event: AstrMessageEvent) -> Dict[str, Any]:
-        """查询当前事件所属平台适配器的消息发送能力。
+        """        查询当前事件所属平台适配器的消息发送能力。
 
         返回字段：
         - forward: 是否支持 Nodes 合并转发（不支持则降级为普通文本分片）
         - file: 是否支持 File 组件发送文件
+        - markdown: 是否支持 Markdown 富文本消息（QQ 官方机器人等）
         - text_chunk_chars: 普通文本分片的建议长度
         - name: 平台名（小写，用于日志）
 
@@ -2585,7 +2679,7 @@ class BKToolsPlugin(Star):
             caps = dict(builtin)
         else:
             # 未知平台：保持与旧版一致的合并转发行为，出问题可由用户自定义覆盖
-            caps = {"forward": True, "file": True, "text_chunk_chars": 3500}
+            caps = {"forward": True, "file": True, "markdown": False, "text_chunk_chars": 3500}
         caps["name"] = name or "unknown"
 
         raw = ""
@@ -2607,7 +2701,7 @@ class BKToolsPlugin(Star):
             if isinstance(custom, dict):
                 over = custom.get(name)
                 if isinstance(over, dict):
-                    for key in ("forward", "file"):
+                    for key in ("forward", "file", "markdown"):
                         if key in over:
                             caps[key] = bool(over[key])
                     tc = over.get("text_chunk_chars")
@@ -2616,13 +2710,83 @@ class BKToolsPlugin(Star):
                             tc, caps["text_chunk_chars"]
                         )
                     logger.info(
-                        "平台 %s 使用自定义适配器能力: forward=%s, file=%s, text_chunk_chars=%s",
-                        caps["name"], caps["forward"], caps["file"], caps["text_chunk_chars"],
+                        "平台 %s 使用自定义适配器能力: forward=%s, file=%s, markdown=%s, text_chunk_chars=%s",
+                        caps["name"], caps["forward"], caps["file"],
+                        caps.get("markdown", False), caps["text_chunk_chars"],
                     )
         caps["text_chunk_chars"] = max(
             200, min(_to_int(caps.get("text_chunk_chars"), 3500), 20000)
         )
         return caps
+
+    def _official_markdown_enabled(self, event: AstrMessageEvent) -> bool:
+        """官方机器人（qq_official 系）是否启用 Markdown 排版输出。
+
+        需同时满足：适配器能力表 markdown=True（内置 qq_official 或用户自定义
+        开启）且 message.official_markdown 配置未关闭（默认开启）。AstrBot 的
+        qqofficial 适配器在机器人未获得原生 Markdown 权限时会把 msg_type=2
+        自动回退为纯文本，因此开启该选项是安全的。
+        """
+        try:
+            caps = self._adapter_caps(event)
+            if not caps.get("markdown"):
+                return False
+            msg_cfg = _cfg(self._runtime_config(), "message", default={}) or {}
+            return bool(msg_cfg.get("official_markdown", True))
+        except Exception:
+            return False
+
+    def _text_result(
+        self,
+        event: AstrMessageEvent,
+        text: str,
+        *,
+        markdown: Optional[bool] = None,
+    ):
+        """构造纯文本结果并按平台能力补 use_markdown_ 标记。
+
+        markdown 三态：
+        - None：跟随能力表与配置（官方机器人默认启用 Markdown）；
+        - True：强制 Markdown（仅官方机器人实际生效，其余平台忽略该标记）；
+        - False：强制纯文本（JSON 原文分片等场景，避免被 Markdown 渲染破坏）。
+        """
+        res = event.plain_result(text)
+        try:
+            if markdown is False:
+                res.use_markdown(False)
+            elif markdown is True:
+                res.use_markdown(True)
+            elif markdown is None and self._official_markdown_enabled(event):
+                res.use_markdown(True)
+        except Exception:
+            # 老版本 AstrBot 无 use_markdown 方法时静默忽略，保持纯文本行为
+            pass
+        return res
+
+    def _official_button_row(self, url: str):
+        """构造「原始链接」跳转按钮行（仅 QQ 官方机器人 keyboard 场景）。
+
+        需要官方平台 keyboard 权限；AstrBot/按钮组件缺失或链接非法时返回 None。
+        """
+        if not _BUTTONS_READY or ActionRow is None or Button is None:
+            return None
+        link = (url or "").strip()
+        if not link.startswith(("http://", "https://")):
+            return None
+        try:
+            return ActionRow(
+                buttons=[
+                    Button(
+                        id=f"bktools_link_{int(time.time() * 1000) % 1000000000}",
+                        label="原始链接",
+                        action=Button.UrlAction(url=link),
+                        style=Button.Style.PRIMARY,
+                    )
+                ]
+            )
+        except Exception as ex:
+            logger.debug("构造官方机器人按钮失败: %s", ex)
+            return None
 
     def _bot_identity(self, event: AstrMessageEvent) -> Tuple[str, Any]:
         name = "BKtools"

@@ -1,6 +1,13 @@
 # astrbot_plugin_bktools（BKtools）
 
-当前版本：`v1.7.4`，要求 AstrBot `v4.10.4+`，已验证兼容 AstrBot `v4.25.5`。
+当前版本：`v1.7.5`，要求 AstrBot `v4.10.4+`，已验证兼容 AstrBot `v4.25.5`。
+
+## v1.7.5 官方机器人 Markdown 输出优化
+
+- QQ 官方机器人（`qq_official`）发送摘要卡片时按 **Markdown 排版**（字段标签加粗，如 `**标题**：xxx`），观感更好；机器人未获得原生 Markdown 权限时 AstrBot 会自动回退纯文本，开启无副作用
+- JSON 原文分片**强制纯文本**发送，避免 JSON 被 Markdown 渲染破坏
+- 可选 `message.official_buttons`（默认关闭）：批量输出摘要卡片附带**「原始链接」跳转按钮**（inline keyboard）。需在 QQ 开放平台申请 keyboard 权限；未授权时发送失败会自动降级为无按钮摘要重发，AstrBot 版本过旧无按钮组件时自动停用
+- 新增 `message.official_markdown`（默认开启）开关；适配器能力表新增 `markdown` 位，`message.custom_adapter_caps` 可按平台自定义覆盖
 
 ## v1.7.1 引用消息链接修复
 

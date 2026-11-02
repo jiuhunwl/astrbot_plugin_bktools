@@ -674,5 +674,196 @@ class AdapterCapsTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(kinds, ["plain", "chain"])  # 摘要 + JSON 文件
 
 
+class _MDResult:
+    """记录 use_markdown 标记的 mock 发送结果。"""
+
+    def __init__(self, kind, text=None, content=None):
+        self.kind = kind
+        self.text = text
+        self.content = content
+        self.markdown = None  # 未设置
+
+    def use_markdown(self, use):
+        self.markdown = use
+        return self
+
+
+class _MDEvent(_EventOnPlatform):
+    """plain_result/chain_result 返回可记录 use_markdown 标记的对象。"""
+
+    def __init__(self, platform):
+        super().__init__(platform)
+        self.sent = []
+
+    def plain_result(self, text):
+        return _MDResult("plain", text=text)
+
+    def chain_result(self, content):
+        return _MDResult("chain", content=content)
+
+    async def send(self, result):
+        self.sent.append(result)
+
+
+class MarkdownizeTests(unittest.TestCase):
+    """卡片文本 Markdown 化：仅加粗「标签：值」行的标签。"""
+
+    def test_bold_field_labels(self):
+        text = "标题：测试视频\n类型：视频\n作者：小明"
+        out = bk._markdownize_card_text(text)
+        self.assertEqual(
+            out,
+            "**标题**：测试视频\n**类型**：视频\n**作者**：小明",
+        )
+
+    def test_url_value_kept_intact(self):
+        text = "视频直链：https://example.com/a.mp4"
+        out = bk._markdownize_card_text(text)
+        self.assertEqual(out, "**视频直链**：https://example.com/a.mp4")
+
+    def test_json_line_untouched(self):
+        text = '{"code":200,"data":{"url":"x"}}'
+        self.assertEqual(bk._markdownize_card_text(text), text)
+
+    def test_lines_without_colon_untouched(self):
+        text = "作者头像"
+        self.assertEqual(bk._markdownize_card_text(text), text)
+
+    def test_ascii_colon_supported(self):
+        self.assertEqual(
+            bk._markdownize_card_text("size: 12MB"),
+            "**size**：12MB",
+        )
+
+    def test_empty_value_line_untouched(self):
+        self.assertEqual(bk._markdownize_card_text("简介："), "简介：")
+
+
+class OfficialMarkdownTests(unittest.IsolatedAsyncioTestCase):
+    """QQ 官方机器人 Markdown 输出：摘要加粗排版 + JSON 分片强制纯文本。"""
+
+    def _plugin(self, message_cfg=None):
+        cfg = {"opening_enable": False, "short_video_text_metadata": True}
+        cfg.update(message_cfg or {})
+        return bk.BKToolsPlugin(
+            object(),
+            {"message": cfg, "video_threshold": {"threshold_enabled": False}},
+        )
+
+    def test_caps_markdown_flags(self):
+        plugin = self._plugin()
+        self.assertTrue(plugin._adapter_caps(_EventOnPlatform("qq_official"))["markdown"])
+        self.assertFalse(plugin._adapter_caps(_EventOnPlatform("aiocqhttp"))["markdown"])
+        # 未知平台默认关闭 Markdown
+        self.assertFalse(
+            plugin._adapter_caps(_EventOnPlatform("some_new_adapter"))["markdown"]
+        )
+
+    def test_custom_caps_markdown_override(self):
+        plugin = self._plugin({
+            "custom_adapter_caps": json.dumps({"mybot": {"markdown": True}})
+        })
+        self.assertTrue(plugin._adapter_caps(_EventOnPlatform("MyBot"))["markdown"])
+
+    def test_official_markdown_config_toggle(self):
+        plugin = self._plugin()
+        self.assertTrue(plugin._official_markdown_enabled(_EventOnPlatform("qq_official")))
+        self.assertFalse(plugin._official_markdown_enabled(_EventOnPlatform("aiocqhttp")))
+        off = self._plugin({"official_markdown": False})
+        self.assertFalse(off._official_markdown_enabled(_EventOnPlatform("qq_official")))
+
+    async def test_official_header_markdownized_and_json_plain(self):
+        """官方机器人：摘要卡片 Markdown 排版，JSON 分片强制纯文本。"""
+        plugin = self._plugin()
+        big = {"code": 200, "data": {"pad": "x" * 5000}}
+        event = _MDEvent("qq_official")
+        ok = await plugin._send_json_result(
+            event, big, ("t", 0), "测试", header_text="标题：测试视频\n类型：视频",
+        )
+        self.assertTrue(ok)
+        self.assertGreaterEqual(len(event.sent), 2)
+        first, *rest = event.sent
+        self.assertEqual(first.markdown, True)
+        self.assertIn("**标题**：测试视频", first.text)
+        joined = "".join(str(p.text) for p in rest)
+        self.assertIn('"code":200', joined)
+        for piece in rest:
+            self.assertEqual(piece.markdown, False)
+
+    async def test_official_markdown_disabled_keeps_plain(self):
+        """关闭 official_markdown：摘要不做 Markdown 化，全部强制纯文本。"""
+        plugin = self._plugin({"official_markdown": False})
+        event = _MDEvent("qq_official")
+        ok = await plugin._send_json_result(
+            event, {"code": 200}, ("t", 0), "测试", header_text="标题：测试视频",
+        )
+        self.assertTrue(ok)
+        self.assertEqual(len(event.sent), 2)
+        for piece in event.sent:
+            self.assertEqual(piece.markdown, False)
+        self.assertNotIn("**标题**", event.sent[0].text)
+
+    async def test_napcat_untouched_by_markdown_logic(self):
+        """回归：aiocqhttp 平台不走 Markdown 标记（保持旧纯文本行为）。"""
+        plugin = self._plugin()
+        event = _MDEvent("aiocqhttp")
+        ok = await plugin._send_json_result(
+            event, {"code": 200}, ("t", 0), "测试", header_text="标题：测试",
+        )
+        self.assertTrue(ok)
+        for piece in event.sent:
+            self.assertIsNone(piece.markdown)
+
+    async def test_button_attached_and_fallback_without_button(self):
+        """开启按钮：摘要带按钮发送；无 keyboard 权限失败时降级无按钮重发。"""
+        plugin = self._plugin({"official_buttons": True})
+        plugin._official_button_row = lambda url: {"fake": "row"}
+        event = _MDEvent("qq_official")
+
+        async def send(result):
+            if result.kind == "chain":  # 按钮消息模拟无权限失败
+                raise RuntimeError("keyboard not allowed")
+            event.sent.append(result)
+
+        event.send = send
+        ok = await plugin._send_json_result(
+            event, {"code": 200}, ("t", 0), "测试",
+            header_text="标题：测试", link_url="https://v.douyin.com/abc/",
+        )
+        self.assertTrue(ok)
+        self.assertEqual(len(event.sent), 2)
+        self.assertEqual(event.sent[0].markdown, True)
+        self.assertEqual(event.sent[1].markdown, False)  # JSON 分片
+
+    async def test_buttons_default_off_no_button_message(self):
+        """默认配置不开按钮：只有纯摘要消息，没有 chain 形态按钮消息。"""
+        plugin = self._plugin()
+        event = _MDEvent("qq_official")
+        ok = await plugin._send_json_result(
+            event, {"code": 200}, ("t", 0), "测试",
+            header_text="标题：测试", link_url="https://v.douyin.com/abc/",
+        )
+        self.assertTrue(ok)
+        self.assertTrue(all(p.kind == "plain" for p in event.sent))
+
+    async def test_forward_as_plain_markdownizes_card_on_official(self):
+        """官方机器人降级逐条发送：Plain 卡片被 Markdown 化。"""
+        plugin = self._plugin()
+        card = bk.Plain()
+        card.text = "标题：测试视频"  # 测试桩组件无 text 参数，手动补属性
+        nodes = [
+            bk.Node(name="BKtools", uin=10000, content=[card]),
+            bk.Node(name="BKtools", uin=10000, content=[bk.Image("https://x.com/1.jpg")]),
+        ]
+        event = _MDEvent("qq_official")
+        sent_any = await plugin._send_forward_as_plain(
+            event, nodes, ("t", 0), "测试降级"
+        )
+        self.assertTrue(sent_any)
+        self.assertEqual(len(event.sent), 2)
+        self.assertIn("**标题**：测试视频", event.sent[0].text)
+        self.assertEqual(event.sent[0].markdown, True)
+
+
 if __name__ == "__main__":
     unittest.main()
